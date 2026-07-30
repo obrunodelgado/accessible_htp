@@ -18,7 +18,7 @@ const els = {
 };
 
 const STORAGE_KEY = 'gemini_api_key';
-const MODEL = 'gemini-2.5-flash'; // troque para 'gemini-2.5-flash-lite' se preferir menor custo/latência
+const MODEL = 'gemini-3.5-flash-lite'; // troque para 'gemini-2.0-flash-lite' se preferir menor custo/latência
 
 let mediaStream = null;
 let lastImageBase64 = null;
