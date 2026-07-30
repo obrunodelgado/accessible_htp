@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Leitor de Desenho Projetivo — Apoio por Voz</title>
+<meta name="theme-color" content="#000000">
+<link rel="manifest" href="manifest.json">
+<style>
+  :root {
+    --bg: #000;
+    --fg: #fff;
+    --accent: #ffcc00;
+    --danger: #ff5555;
+    --ok: #55ff88;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    font-size: 20px;
+    min-height: 100%;
+  }
+  body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 16px;
+    gap: 16px;
+  }
+  h1 {
+    font-size: 22px;
+    text-align: center;
+    margin: 8px 0;
+  }
+  .status {
+    width: 100%;
+    max-width: 600px;
+    background: #111;
+    border: 2px solid #444;
+    border-radius: 12px;
+    padding: 16px;
+    min-height: 60px;
+    line-height: 1.5;
+  }
+  .status[data-state="listening"] { border-color: var(--accent); }
+  .status[data-state="ok"] { border-color: var(--ok); }
+  .status[data-state="error"] { border-color: var(--danger); }
+
+  button {
+    width: 100%;
+    max-width: 600px;
+    min-height: 72px;
+    font-size: 24px;
+    font-weight: bold;
+    border-radius: 16px;
+    border: 3px solid var(--fg);
+    background: var(--fg);
+    color: #000;
+    cursor: pointer;
+    padding: 12px;
+  }
+  button:active { transform: scale(0.98); }
+  button:focus-visible { outline: 4px solid var(--accent); outline-offset: 2px; }
+  button.secondary {
+    background: #000;
+    color: var(--fg);
+  }
+  button:disabled {
+    opacity: 0.5;
+  }
+
+  .btn-row {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    width: 100%;
+    max-width: 600px;
+  }
+
+  video, canvas, img.preview {
+    width: 100%;
+    max-width: 600px;
+    border-radius: 12px;
+    border: 2px solid #444;
+    display: none;
+  }
+  video.active, canvas.active, img.preview.active { display: block; }
+
+  #resultText {
+    white-space: pre-wrap;
+  }
+
+  .config-panel {
+    width: 100%;
+    max-width: 600px;
+    background: #111;
+    border: 2px solid #444;
+    border-radius: 12px;
+    padding: 16px;
+  }
+  .config-panel label {
+    display: block;
+    margin-bottom: 6px;
+    font-size: 16px;
+  }
+  .config-panel input {
+    width: 100%;
+    font-size: 18px;
+    padding: 10px;
+    border-radius: 8px;
+    border: 2px solid #666;
+    background: #000;
+    color: #fff;
+    min-height: 48px;
+  }
+  .visually-hidden {
+    position: absolute;
+    width: 1px; height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+  }
+  footer {
+    font-size: 14px;
+    color: #999;
+    text-align: center;
+    max-width: 600px;
+    margin-top: 12px;
+  }
+</style>
+</head>
+<body>
+
+<h1>Leitor de Desenho Projetivo (Protótipo)</h1>
+
+<div id="status" class="status" role="status" aria-live="polite" data-state="idle">
+  Toque em "Configurar chave da API" para começar, depois toque em "Tirar foto do desenho".
+</div>
+
+<details class="config-panel">
+  <summary style="cursor:pointer; font-size:18px;">Configurar chave da API do Gemini</summary>
+  <label for="apiKey">Chave da API Gemini (armazenada só neste navegador)</label>
+  <input type="password" id="apiKey" aria-label="Chave da API Gemini" placeholder="Cole sua chave aqui" />
+  <button id="saveKeyBtn" style="margin-top:10px; min-height:48px;">Salvar chave</button>
+</details>
+
+<video id="camera" autoplay playsinline aria-label="Pré-visualização da câmera"></video>
+<canvas id="canvas" class="visually-hidden"></canvas>
+<img id="preview" class="preview" alt="Foto capturada do desenho" />
+
+<div class="btn-row">
+  <button id="captureBtn" aria-label="Ativar câmera e tirar foto do desenho">
+    📷 Tirar foto do desenho
+  </button>
+  <button id="retryBtn" class="secondary" aria-label="Tirar nova foto" style="display:none;">
+    🔁 Tentar novamente
+  </button>
+  <button id="repeatBtn" class="secondary" aria-label="Repetir leitura em voz alta" style="display:none;">
+    🔊 Repetir leitura
+  </button>
+  <button id="voiceCmdBtn" class="secondary" aria-label="Ativar comando de voz">
+    🎙️ Comando de voz
+  </button>
+</div>
+
+<div id="resultText" class="status" aria-live="polite" style="display:none;"></div>
+
+<footer>
+  Protótipo de apoio técnico. As leituras geradas por IA são hipóteses, não diagnósticos.
+  Chave de API armazenada apenas localmente no seu navegador (localStorage).
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
