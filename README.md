@@ -60,6 +60,7 @@ Qualquer uma das três opções entrega HTTPS automaticamente — necessário pa
 3. Toque em **"Tirar foto do desenho"** (ativa a câmera) e toque de novo para capturar.
 4. Aguarde a análise — o app fala automaticamente quando estiver pronta.
 5. Toque em **"Repetir leitura"** para ouvir de novo, ou use **"Comando de voz"** e diga *"foto"*, *"repetir"* ou *"tentar novamente"*.
+5b. Com a câmera ligada, o **guia sonoro de enquadramento** analisa a imagem ao vivo: um tom estéreo indica se a folha está à esquerda/direita (balanço) e se está perto/longe demais (frequência grave = ajustar distância, aguda e estável = pronto para capturar), complementado por frases curtas ("aproxime", "mova para a esquerda", "centralizado, pode capturar"). Pode ser desligado no botão **"Guia sonoro de enquadramento"**.
 6. Para instalar como app (ícone na tela inicial), use a opção "Adicionar à tela inicial" / "Instalar app" do navegador.
 
 ## 5. Limitações conhecidas do protótipo

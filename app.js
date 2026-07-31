@@ -15,6 +15,8 @@ const els = {
   voiceCmdBtn: document.getElementById('voiceCmdBtn'),
   apiKeyInput: document.getElementById('apiKey'),
   saveKeyBtn: document.getElementById('saveKeyBtn'),
+  guideToggleBtn: document.getElementById('guideToggleBtn'),
+  guideCanvas: document.getElementById('guideCanvas'),
 };
 
 const STORAGE_KEY = 'gemini_api_key';
@@ -68,6 +70,219 @@ const sounds = {
 };
 
 // -------------------------------------------------------------------------
+// Guia sonoro de enquadramento
+// Enquanto a câmera está ligada (antes da captura), analisa o quadro ao vivo
+// para localizar a folha (região clara sobre fundo mais escuro) e emite um
+// tom contínuo: o balanço estéreo indica a direção (esquerda/direita) e a
+// frequência indica se é preciso aproximar ou afastar a câmera. Frases
+// curtas complementam o som em intervalos espaçados para não sobrecarregar.
+// -------------------------------------------------------------------------
+
+let framingGuideEnabled = true; // pode ser desligado pelo botão "Guia sonoro"
+let guideAudioCtx = null;
+let guideOsc = null;
+let guideGain = null;
+let guidePanner = null;
+let guideIntervalId = null;
+let guideLastSpokenAt = 0;
+let guideLastPhrase = '';
+
+// Faixa de cobertura da folha em relação ao quadro considerada boa distância
+const GUIDE_TARGET_COVERAGE_MIN = 0.30;
+const GUIDE_TARGET_COVERAGE_MAX = 0.65;
+const GUIDE_CENTER_MARGIN = 0.08; // ~8% do quadro contado como "centralizado"
+
+function ensureGuideAudio() {
+  if (guideAudioCtx) return;
+  try {
+    guideAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    guideOsc = guideAudioCtx.createOscillator();
+    guideGain = guideAudioCtx.createGain();
+    guidePanner = guideAudioCtx.createStereoPanner
+      ? guideAudioCtx.createStereoPanner()
+      : null;
+    guideOsc.type = 'sine';
+    guideGain.gain.value = 0;
+    guideOsc.connect(guideGain);
+    if (guidePanner) {
+      guideGain.connect(guidePanner);
+      guidePanner.connect(guideAudioCtx.destination);
+    } else {
+      guideGain.connect(guideAudioCtx.destination);
+    }
+    guideOsc.start();
+  } catch (e) {
+    guideAudioCtx = null;
+  }
+}
+
+function stopGuideAudio() {
+  if (guideGain) {
+    try { guideGain.gain.setTargetAtTime(0, guideAudioCtx.currentTime, 0.05); } catch (e) { /* noop */ }
+  }
+  if (guideAudioCtx) {
+    try { guideOsc.stop(); } catch (e) { /* noop */ }
+    try { guideAudioCtx.close(); } catch (e) { /* noop */ }
+  }
+  guideAudioCtx = null;
+  guideOsc = null;
+  guideGain = null;
+  guidePanner = null;
+}
+
+// Encontra a bounding box da região "clara" do quadro usando um limiar
+// simples baseado no brilho médio (a folha costuma ser mais clara que a
+// mesa/fundo). Retorna null se não achar contraste suficiente.
+function detectSheetBounds(imageData, width, height) {
+  const { data } = imageData;
+  let sum = 0;
+  const n = width * height;
+  for (let i = 0; i < data.length; i += 4) {
+    sum += (data[i] + data[i + 1] + data[i + 2]) / 3;
+  }
+  const mean = sum / n;
+  const threshold = mean + 20; // um pouco acima da média para pegar só o mais claro
+
+  let minX = width, minY = height, maxX = 0, maxY = 0, brightCount = 0;
+  let idx = 0;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const b = (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
+      if (b > threshold) {
+        brightCount++;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+      idx += 4;
+    }
+  }
+
+  if (brightCount < n * 0.02) return null; // quase nada de claro: sem folha detectável
+
+  return {
+    minX, minY, maxX, maxY,
+    coverage: brightCount / n,
+    centerX: (minX + maxX) / 2 / width,
+    centerY: (minY + maxY) / 2 / height,
+  };
+}
+
+function speakGuide(text) {
+  const now = performance.now();
+  if (text === guideLastPhrase && now - guideLastSpokenAt < 2200) return; // evita repetição
+  guideLastSpokenAt = now;
+  guideLastPhrase = text;
+  speak(text, { interrupt: false });
+}
+
+function analyzeFrameForGuide() {
+  const video = els.camera;
+  if (!video.videoWidth) return;
+
+  const w = 96;
+  const h = Math.max(1, Math.round((96 * video.videoHeight) / video.videoWidth));
+  const gCanvas = els.guideCanvas;
+  gCanvas.width = w;
+  gCanvas.height = h;
+  const ctx = gCanvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(video, 0, 0, w, h);
+  const imageData = ctx.getImageData(0, 0, w, h);
+  const bounds = detectSheetBounds(imageData, w, h);
+
+  ensureGuideAudio();
+  if (!guideAudioCtx) return;
+  const now = guideAudioCtx.currentTime;
+
+  if (!bounds) {
+    // Sem folha detectada: tom baixo e intermitente, sem direção
+    guideGain.gain.setTargetAtTime(0.05, now, 0.1);
+    guideOsc.frequency.setTargetAtTime(220, now, 0.1);
+    if (guidePanner) guidePanner.pan.setTargetAtTime(0, now, 0.1);
+    speakGuide('Não encontro a folha. Aponte a câmera para ela e melhore a iluminação.');
+    return;
+  }
+
+  const dx = bounds.centerX - 0.5; // negativo = folha à esquerda do quadro
+  const dy = bounds.centerY - 0.5;
+  const centered = Math.abs(dx) < GUIDE_CENTER_MARGIN && Math.abs(dy) < GUIDE_CENTER_MARGIN;
+  const distanceOk = bounds.coverage >= GUIDE_TARGET_COVERAGE_MIN && bounds.coverage <= GUIDE_TARGET_COVERAGE_MAX;
+
+  // Balanço estéreo: acompanha o desvio horizontal da folha (-1 a 1)
+  const pan = Math.max(-1, Math.min(1, dx * 2.2));
+  if (guidePanner) guidePanner.pan.setTargetAtTime(pan, now, 0.08);
+
+  // Frequência: mais alta quando a folha está próxima do enquadramento ideal
+  // (perto do centro e da cobertura alvo); mais grave quando está longe.
+  let freq = 300;
+  if (bounds.coverage < GUIDE_TARGET_COVERAGE_MIN) {
+    freq = 260; // folha pequena demais: precisa aproximar
+  } else if (bounds.coverage > GUIDE_TARGET_COVERAGE_MAX) {
+    freq = 340; // folha grande demais: precisa afastar
+  } else {
+    freq = 500;
+  }
+  if (centered && distanceOk) freq = 880; // tom agudo e estável = pronto para capturar
+  guideOsc.frequency.setTargetAtTime(freq, now, 0.08);
+  guideGain.gain.setTargetAtTime(centered && distanceOk ? 0.12 : 0.08, now, 0.08);
+
+  // Feedback falado, só quando muda a situação principal
+  if (centered && distanceOk) {
+    speakGuide('Centralizado e na distância certa. Pode capturar.');
+  } else if (!distanceOk && bounds.coverage < GUIDE_TARGET_COVERAGE_MIN) {
+    speakGuide('Aproxime a câmera da folha.');
+  } else if (!distanceOk && bounds.coverage > GUIDE_TARGET_COVERAGE_MAX) {
+    speakGuide('Afaste um pouco a câmera.');
+  } else if (Math.abs(dx) >= GUIDE_CENTER_MARGIN) {
+    speakGuide(dx < 0 ? 'Mova a câmera um pouco para a esquerda.' : 'Mova a câmera um pouco para a direita.');
+  } else if (Math.abs(dy) >= GUIDE_CENTER_MARGIN) {
+    speakGuide(dy < 0 ? 'Mova a câmera um pouco para cima.' : 'Mova a câmera um pouco para baixo.');
+  }
+}
+
+function startFramingGuide() {
+  if (!framingGuideEnabled) return;
+  stopFramingGuide();
+  guideIntervalId = setInterval(analyzeFrameForGuide, 450);
+}
+
+function stopFramingGuide() {
+  if (guideIntervalId) {
+    clearInterval(guideIntervalId);
+    guideIntervalId = null;
+  }
+  stopGuideAudio();
+  guideLastPhrase = '';
+}
+
+function initGuideToggle() {
+  if (!els.guideToggleBtn) return;
+  updateGuideToggleLabel();
+  els.guideToggleBtn.addEventListener('click', () => {
+    framingGuideEnabled = !framingGuideEnabled;
+    updateGuideToggleLabel();
+    sounds.action();
+    if (framingGuideEnabled && mediaStream) {
+      setStatus('Guia sonoro de enquadramento ativado.', 'ok');
+      startFramingGuide();
+    } else {
+      setStatus('Guia sonoro de enquadramento desativado.', 'idle');
+      stopFramingGuide();
+    }
+  });
+}
+
+function updateGuideToggleLabel() {
+  if (!els.guideToggleBtn) return;
+  const label = framingGuideEnabled
+    ? '🔊 Guia sonoro de enquadramento: ligado'
+    : '🔈 Guia sonoro de enquadramento: desligado';
+  els.guideToggleBtn.textContent = label;
+  els.guideToggleBtn.setAttribute('aria-label', label);
+}
+
+// -------------------------------------------------------------------------
 // Configuração da chave de API (nunca hardcoded)
 // -------------------------------------------------------------------------
 
@@ -108,6 +323,7 @@ async function startCamera() {
     setStatus('Câmera ativada. Toque novamente no botão para capturar a foto.', 'idle');
     els.captureBtn.textContent = '📸 Capturar agora';
     els.captureBtn.setAttribute('aria-label', 'Capturar foto agora');
+    startFramingGuide();
   } catch (err) {
     sounds.error();
     setStatus('Não foi possível acessar a câmera. Verifique as permissões do navegador e tente novamente.', 'error');
@@ -120,6 +336,7 @@ function stopCamera() {
     mediaStream = null;
   }
   els.camera.classList.remove('active');
+  stopFramingGuide();
 }
 
 function capturePhoto() {
@@ -354,6 +571,7 @@ els.repeatBtn.addEventListener('click', repeatResult);
 
 initApiKeyUI();
 initVoiceCommands();
+initGuideToggle();
 
 // -------------------------------------------------------------------------
 // Registro do Service Worker (PWA instalável)
