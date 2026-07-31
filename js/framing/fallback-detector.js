@@ -9,22 +9,19 @@
 
    Esta é a fonte "quente" do app antes do OpenCV carregar e o fallback
    permanente se o WASM/Worker falhar (A7).
+
+   F1 (B1): o acumulador de stats vem de createStats() em ./stats.js, não é
+   mais um singleton de módulo. Cada fonte instancia o seu — guide.js delega
+   ao acumulador da fonte ativa.
    ========================================================================= */
 
-// Estatísticas acumuladas para instrumentação (F0 passo 6).
-// ms por frame + fps efetivo + amostras de ms (cap em SAMPLES_CAP) para
-// mediana/p95. Resetáveis via resetStats() para medir janelas.
-const SAMPLES_CAP = 1000; // últimos N frames; ring buffer implícito via shift
-const stats = {
-  frames: 0,
-  foundFrames: 0,
-  totalMs: 0,
-  minMs: Infinity,
-  maxMs: 0,
-  firstFrameAt: 0,
-  lastFrameAt: 0,
-  msSamples: [], // para mediana/p95 (cap em SAMPLES_CAP)
-};
+import { createStats } from './stats.js';
+
+const stats = createStats();
+
+// Exportado para que guide.js delegue getStats/resetStats ao acumulador da
+// fonte ativa (B1) — o guia não acumula nada próprio.
+export { stats as _stats };
 
 /**
  * Detecta a bounding box da região "clara" do quadro (a folha costuma ser
@@ -76,7 +73,7 @@ export function detect(imageData, width, height) {
 
   const ms = performance.now() - t0;
   const found = brightCount >= n * 0.02;
-  recordStats(ms, found);
+  stats.record(ms, found);
 
   if (!found) {
     // quase nada de claro: sem folha detectável
@@ -104,41 +101,9 @@ export function detect(imageData, width, height) {
   };
 }
 
-function recordStats(ms, found) {
-  stats.frames++;
-  if (found) stats.foundFrames++;
-  stats.totalMs += ms;
-  if (ms < stats.minMs) stats.minMs = ms;
-  if (ms > stats.maxMs) stats.maxMs = ms;
-  // Ring buffer: mantém só os últimos SAMPLES_CAP ms para mediana/p95.
-  // Shift é O(n) no cap, mas o cap é pequeno e a janela roda raramente.
-  stats.msSamples.push(ms);
-  if (stats.msSamples.length > SAMPLES_CAP) stats.msSamples.shift();
-  const now = performance.now();
-  if (stats.firstFrameAt === 0) stats.firstFrameAt = now;
-  stats.lastFrameAt = now;
-}
-
 /** Reseta o acumulador de estatísticas (para medir janelas isoladas). */
 export function resetStats() {
-  stats.frames = 0;
-  stats.foundFrames = 0;
-  stats.totalMs = 0;
-  stats.minMs = Infinity;
-  stats.maxMs = 0;
-  stats.firstFrameAt = 0;
-  stats.lastFrameAt = 0;
-  stats.msSamples = [];
-}
-
-// Percentil de um array ordenado (q em 0..1). Não muta o input.
-function percentile(sorted, q) {
-  if (!sorted.length) return 0;
-  const pos = (sorted.length - 1) * q;
-  const lo = Math.floor(pos);
-  const hi = Math.ceil(pos);
-  if (lo === hi) return sorted[lo];
-  return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
+  stats.reset();
 }
 
 /**
@@ -149,30 +114,11 @@ function percentile(sorted, q) {
  * mediana/p95 vêm das últimas SAMPLES_CAP amostras (ring buffer), não de
  * toda a sessão — úteis para latência, onde a cauda importa mais que a
  * média. Usado pelo harness e pelo BENCHMARK.md de F0.
+ *
+ * F1 (B1): pass-through para o acumulador createStats() da instância.
  */
 export function getStats() {
-  const frames = stats.frames;
-  // elapsed mede o span entre 1º e último frame = (N−1) intervalos.
-  // fps = frames / elapsed superestima (conta N frames em N−1 intervalos);
-  // por isso (frames−1)/elapsed. Com 1 frame, elapsed===0 → fps 0.
-  const elapsed = stats.firstFrameAt && stats.lastFrameAt && frames > 1
-    ? (stats.lastFrameAt - stats.firstFrameAt) / 1000
-    : 0;
-  const avgMs = frames ? stats.totalMs / frames : 0;
-  const fps = elapsed > 0 ? (frames - 1) / elapsed : 0;
-  const sorted = [...stats.msSamples].sort((a, b) => a - b);
-  return {
-    frames,
-    foundFrames: stats.foundFrames,
-    foundRate: frames ? stats.foundFrames / frames : 0,
-    avgMs,
-    medianMs: percentile(sorted, 0.5),
-    p95Ms: percentile(sorted, 0.95),
-    minMs: frames ? stats.minMs : 0,
-    maxMs: frames ? stats.maxMs : 0,
-    fps,
-    elapsedS: elapsed,
-  };
+  return stats.get();
 }
 
 /**

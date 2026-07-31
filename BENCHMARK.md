@@ -179,16 +179,82 @@ existir.
 
 ---
 
-## F1 — Gates (medir logo após `ready` do worker)  `[PENDENTE: F1]`
+## F1 — Gates medidos  `[PENDENTE: aparelho + dataset]`
 
-- [ ] **Gate de A4**: `cv.HEAPU8.buffer.byteLength` do primeiro `result`. Build
-  oficial costuma ficar em 30–50 MB. Se estourar 40 MB, **parar antes de F2**:
-  build customizado ou renegociar A4.
-- [ ] **Gate de carga**: tempo desde `start()` até `ready`. Se >45 s em 3G no
-  aparelho de referência, build customizado passa a ser necessário (item de F6).
-- [ ] **Gate de Otsu puro**: rodar harness com Otsu-only contra a baseline
-  heurística de F0. Se ≥85% (A1), a cascata vira opcional e F2 encolhe para só
-  o score. Se 80–88%, expandir o dataset de stills antes de decidir.
+### Gate de A4 — Heap WASM inicial
+
+`cv.HEAPU8.buffer.byteLength` do primeiro `result` do worker. Build oficial
+(4.13.0) costuma ficar em 30–50 MB. Se estourar 40 MB, **parar antes de F2**:
+build customizado (core+imgproc) ou renegociar A4.
+
+| Métrica | Valor |
+|---|---|
+| Heap WASM inicial | `[PENDENTE]` MB |
+| JS heap baseline (antes start) | `[PENDENTE]` MB |
+| JS heap após 60 s | `[PENDENTE]` MB |
+
+**Nota sobre heap WASM em repouso (B4 vs A4)**: o gate A4 mede o heap logo
+após `ready` — o número não muda com B4. O que muda é o **perfil de memória
+em repouso**: manter o worker vivo entre toggles segura ~30–50 MB de heap
+WASM pelo resto da sessão, mesmo com o guia desligado. Se o aparelho-alvo
+for apertado, a alternativa é `terminate()` após N minutos ocioso (F6),
+**não** voltar a terminar no `stop()` — isso reintroduz o custo de re-init
+a cada toggle que B4 eliminou.
+
+### Gate de carga — Tempo até `ready`
+
+Tempo desde `start()` até o worker emitir `ready`. Se >45 s em 3G no
+aparelho de referência, build customizado passa a ser necessário (F6).
+
+| Métrica | Valor |
+|---|---|
+| Tempo até `ready` (desktop) | `[PENDENTE]` s |
+| Tempo até `ready` (3G aparelho) | `[PENDENTE]` s |
+
+### Gate de Otsu puro — Acurácia (A1)
+
+Rodar `harness.html` com botão "Rodar stills com worker (Otsu)" contra
+baseline heurística de F0. Se ≥85% (A1), a cascata vira opcional e F2
+encolhe para só o score. Se 80–88%, expandir o dataset de stills antes.
+
+| Métrica | FallbackDetector (F0) | Worker Otsu (F1) |
+|---|---|---|
+| Acurácia `found` | `[PENDENTE]` % | `[PENDENTE]` % |
+| Erro de centro mediano (px) | `[PENDENTE]` | `[PENDENTE]` |
+| `ms` mediano | `[PENDENTE]` | `[PENDENTE]` |
+| fps efetivo | `[PENDENTE]` | `[PENDENTE]` |
+
+**Nota sobre definição de `found`**: o gate A1 compara Otsu-only
+(quadrilátero convexo + área ≥8%) contra baseline heurística (2% de pixels
+claros). Os dois critérios medem coisas diferentes — a comparação só é
+honesta se a diferença de definição estiver registrada junto com o número.
+
+### A2 — Latência do worker  `[PENDENTE: aparelho]`
+
+| Métrica | Valor |
+|---|---|
+| `ms` mediano (worker Otsu) | `[PENDENTE]` |
+| `ms` p95 | `[PENDENTE]` |
+| `ms` máx | `[PENDENTE]` |
+
+### A3 — Taxa de processamento com worker  `[PENDENTE: aparelho]`
+
+| Métrica | Valor |
+|---|---|
+| fps efetivo (loop 450 ms) | `[PENDENTE]` |
+| Intervalo nominal | 450 ms (adaptativo 300–700) |
+
+**Nota sobre largura 96→160**: o código de F0 usava `w=96`. F1 usa `w=160`
+para alinhar com o harness e tornar as medições comparáveis entre fontes.
+O FallbackDetector (fonte ativa durante a carga do OpenCV e permanentemente
+em falha) roda agora a 160 — ~2,8× mais pixels que antes. **Afeta A2/A3**.
+Registrar a largura junto ao `ms` em todas as medições — sem isso, medições
+em larguras diferentes não são comparáveis.
+
+**Nota sobre `frameMs` do harness com worker**: com `await detect(...)`,
+`frameMs` inclui o round-trip de `postMessage` + transfer, não só
+`drawImage` + `getImageData` + `detect`. **Não comparável** com o número
+de F0 — medir e registrar separadamente. Desejável para o orçamento de A8.
 
 ---
 

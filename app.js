@@ -3,7 +3,9 @@
    Fluxo: câmera -> foto -> Gemini (multimodal) -> descrição/hipóteses -> voz
    ========================================================================= */
 
-import { detect as detectSheet } from './js/framing/fallback-detector.js';
+import { FramingGuide } from './js/framing/guide.js';
+import { audio } from './js/framing/audio.js';
+import { queue as speechQueue, PRIORITY } from './js/speech.js';
 
 const els = {
   status: document.getElementById('status'),
@@ -32,13 +34,16 @@ let lastResultSpokenText = '';
 // Utilidades de voz (feedback sonoro + leitura do resultado)
 // -------------------------------------------------------------------------
 
+// F1: speak() delega à SpeechQueue com prioridade STATUS (0). A fila garante
+// que mensagens de status não sejam canceladas por direções do guia (GUIDE=1)
+// e vice-versa — preempção só quando a nova tem prioridade maior (número menor).
+// B2 (review): NÃO chama clear() — clear() sem argumento mata tudo (inclusive
+// GUIDE), reproduzindo o speechSynthesis.cancel() que se queria substituir.
+// A preempção por prioridade já faz o trabalho: STATUS (0) preempciona GUIDE
+// (1) se estiver em reprodução, sem esvaziar a fila.
 function speak(text, { interrupt = true } = {}) {
   if (!('speechSynthesis' in window)) return;
-  if (interrupt) window.speechSynthesis.cancel();
-  const utter = new SpeechSynthesisUtterance(text);
-  utter.lang = 'pt-BR';
-  utter.rate = 1;
-  window.speechSynthesis.speak(utter);
+  speechQueue.speak(text, PRIORITY.STATUS);
 }
 
 function setStatus(message, state = 'idle', { announceOnly = false } = {}) {
@@ -47,21 +52,12 @@ function setStatus(message, state = 'idle', { announceOnly = false } = {}) {
   if (!announceOnly) speak(message);
 }
 
-// Pequenos "bips" de feedback sonoro usando WebAudio, para não depender só de TTS
+// Pequenos "bips" de feedback sonoro usando WebAudio, para não depender só de TTS.
+// F1: beep() delega ao singleton audio.beep() — reaproveita o AudioContext
+// compartilhado (Chrome limita a ~6 contextos por página). sounds (paleta
+// semântica ok/action/error/sending) mantido intacto — zero call sites tocados.
 function beep(freq = 440, duration = 120, type = 'sine') {
-  try {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.type = type;
-    osc.frequency.value = freq;
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    gain.gain.setValueAtTime(0.15, ctx.currentTime);
-    osc.start();
-    osc.stop(ctx.currentTime + duration / 1000);
-    osc.onended = () => ctx.close();
-  } catch (e) { /* silencioso */ }
+  audio.beep(freq, duration, type);
 }
 
 const sounds = {
@@ -72,151 +68,22 @@ const sounds = {
 };
 
 // -------------------------------------------------------------------------
-// Guia sonoro de enquadramento
-// Enquanto a câmera está ligada (antes da captura), analisa o quadro ao vivo
-// para localizar a folha (região clara sobre fundo mais escuro) e emite um
-// tom contínuo: o balanço estéreo indica a direção (esquerda/direita) e a
-// frequência indica se é preciso aproximar ou afastar a câmera. Frases
-// curtas complementam o som em intervalos espaçados para não sobrecarregar.
+// Guia sonoro de enquadramento (F1: delegado a FramingGuide)
+// O pipeline heurístico inline foi substituído por FramingGuide, que coordena
+// FallbackDetector (fonte ativa inicial) + worker OpenCV.js (Otsu-only).
+// Áudio/TTS em módulos: js/framing/audio.js (singleton) + js/speech.js (fila).
 // -------------------------------------------------------------------------
 
+const framingGuide = new FramingGuide();
 let framingGuideEnabled = true; // pode ser desligado pelo botão "Guia sonoro"
-let guideAudioCtx = null;
-let guideOsc = null;
-let guideGain = null;
-let guidePanner = null;
-let guideIntervalId = null;
-let guideLastSpokenAt = 0;
-let guideLastPhrase = '';
-
-// Faixa de cobertura da folha em relação ao quadro considerada boa distância
-const GUIDE_TARGET_COVERAGE_MIN = 0.30;
-const GUIDE_TARGET_COVERAGE_MAX = 0.65;
-const GUIDE_CENTER_MARGIN = 0.08; // ~8% do quadro contado como "centralizado"
-
-function ensureGuideAudio() {
-  if (guideAudioCtx) return;
-  try {
-    guideAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    guideOsc = guideAudioCtx.createOscillator();
-    guideGain = guideAudioCtx.createGain();
-    guidePanner = guideAudioCtx.createStereoPanner
-      ? guideAudioCtx.createStereoPanner()
-      : null;
-    guideOsc.type = 'sine';
-    guideGain.gain.value = 0;
-    guideOsc.connect(guideGain);
-    if (guidePanner) {
-      guideGain.connect(guidePanner);
-      guidePanner.connect(guideAudioCtx.destination);
-    } else {
-      guideGain.connect(guideAudioCtx.destination);
-    }
-    guideOsc.start();
-  } catch (e) {
-    guideAudioCtx = null;
-  }
-}
-
-function stopGuideAudio() {
-  if (guideGain) {
-    try { guideGain.gain.setTargetAtTime(0, guideAudioCtx.currentTime, 0.05); } catch (e) { /* noop */ }
-  }
-  if (guideAudioCtx) {
-    try { guideOsc.stop(); } catch (e) { /* noop */ }
-    try { guideAudioCtx.close(); } catch (e) { /* noop */ }
-  }
-  guideAudioCtx = null;
-  guideOsc = null;
-  guideGain = null;
-  guidePanner = null;
-}
-
-function speakGuide(text) {
-  const now = performance.now();
-  if (text === guideLastPhrase && now - guideLastSpokenAt < 2200) return; // evita repetição
-  guideLastSpokenAt = now;
-  guideLastPhrase = text;
-  speak(text, { interrupt: false });
-}
-
-function analyzeFrameForGuide() {
-  const video = els.camera;
-  if (!video.videoWidth) return;
-
-  const w = 96;
-  const h = Math.max(1, Math.round((96 * video.videoHeight) / video.videoWidth));
-  const gCanvas = els.guideCanvas;
-  gCanvas.width = w;
-  gCanvas.height = h;
-  const ctx = gCanvas.getContext('2d', { willReadFrequently: true });
-  ctx.drawImage(video, 0, 0, w, h);
-  const imageData = ctx.getImageData(0, 0, w, h);
-  const result = detectSheet(imageData, w, h);
-
-  ensureGuideAudio();
-  if (!guideAudioCtx) return;
-  const now = guideAudioCtx.currentTime;
-
-  if (!result.found) {
-    // Sem folha detectada: tom baixo e intermitente, sem direção
-    guideGain.gain.setTargetAtTime(0.05, now, 0.1);
-    guideOsc.frequency.setTargetAtTime(220, now, 0.1);
-    if (guidePanner) guidePanner.pan.setTargetAtTime(0, now, 0.1);
-    speakGuide('Não encontro a folha. Aponte a câmera para ela e melhore a iluminação.');
-    return;
-  }
-
-  const dx = result.cx - 0.5; // negativo = folha à esquerda do quadro
-  const dy = result.cy - 0.5;
-  const centered = Math.abs(dx) < GUIDE_CENTER_MARGIN && Math.abs(dy) < GUIDE_CENTER_MARGIN;
-  const distanceOk = result.coverage >= GUIDE_TARGET_COVERAGE_MIN && result.coverage <= GUIDE_TARGET_COVERAGE_MAX;
-
-  // Balanço estéreo: acompanha o desvio horizontal da folha (-1 a 1)
-  const pan = Math.max(-1, Math.min(1, dx * 2.2));
-  if (guidePanner) guidePanner.pan.setTargetAtTime(pan, now, 0.08);
-
-  // Frequência: mais alta quando a folha está próxima do enquadramento ideal
-  // (perto do centro e da cobertura alvo); mais grave quando está longe.
-  let freq = 300;
-  if (result.coverage < GUIDE_TARGET_COVERAGE_MIN) {
-    freq = 260; // folha pequena demais: precisa aproximar
-  } else if (result.coverage > GUIDE_TARGET_COVERAGE_MAX) {
-    freq = 340; // folha grande demais: precisa afastar
-  } else {
-    freq = 500;
-  }
-  if (centered && distanceOk) freq = 880; // tom agudo e estável = pronto para capturar
-  guideOsc.frequency.setTargetAtTime(freq, now, 0.08);
-  guideGain.gain.setTargetAtTime(centered && distanceOk ? 0.12 : 0.08, now, 0.08);
-
-  // Feedback falado, só quando muda a situação principal
-  if (centered && distanceOk) {
-    speakGuide('Centralizado e na distância certa. Pode capturar.');
-  } else if (!distanceOk && result.coverage < GUIDE_TARGET_COVERAGE_MIN) {
-    speakGuide('Aproxime a câmera da folha.');
-  } else if (!distanceOk && result.coverage > GUIDE_TARGET_COVERAGE_MAX) {
-    speakGuide('Afaste um pouco a câmera.');
-  } else if (Math.abs(dx) >= GUIDE_CENTER_MARGIN) {
-    speakGuide(dx < 0 ? 'Mova a câmera um pouco para a esquerda.' : 'Mova a câmera um pouco para a direita.');
-  } else if (Math.abs(dy) >= GUIDE_CENTER_MARGIN) {
-    speakGuide(dy < 0 ? 'Mova a câmera um pouco para cima.' : 'Mova a câmera um pouco para baixo.');
-  }
-}
 
 function startFramingGuide() {
   if (!framingGuideEnabled) return;
-  stopFramingGuide();
-  guideIntervalId = setInterval(analyzeFrameForGuide, 450);
+  framingGuide.start(els.camera, els.guideCanvas);
 }
 
 function stopFramingGuide() {
-  if (guideIntervalId) {
-    clearInterval(guideIntervalId);
-    guideIntervalId = null;
-  }
-  stopGuideAudio();
-  guideLastPhrase = '';
+  framingGuide.stop();
 }
 
 function initGuideToggle() {
@@ -227,6 +94,9 @@ function initGuideToggle() {
     updateGuideToggleLabel();
     sounds.action();
     if (framingGuideEnabled && mediaStream) {
+      // audio.activate() só ao LIGAR o guia — desligar não precisa de contexto.
+      // Menor (review): antes roda ao desligar também, criando AudioContext à toa.
+      audio.activate();
       setStatus('Guia sonoro de enquadramento ativado.', 'ok');
       startFramingGuide();
     } else {
@@ -477,6 +347,10 @@ function initVoiceCommands() {
   };
 
   els.voiceCmdBtn.addEventListener('click', () => {
+    // G5 (review): ativar o AudioContext no gesto que inicia o reconhecimento
+    // de voz — startCamera() por comando de voz não passa pelo captureBtn,
+    // e sem activate() o guia fica mudo (audio.update() retorna cedo se !ctx).
+    audio.activate();
     sounds.action();
     setStatus('Ouvindo comando de voz. Diga: foto, repetir, ou tentar novamente.', 'idle', { announceOnly: true });
     speak('Ouvindo comando.');
@@ -522,6 +396,8 @@ function resetFlow() {
 // -------------------------------------------------------------------------
 
 els.captureBtn.addEventListener('click', () => {
+  // audio.activate() dentro do gesto — correção defensiva do AudioContext.
+  audio.activate();
   if (!mediaStream) {
     startCamera();
   } else {
@@ -535,6 +411,12 @@ els.repeatBtn.addEventListener('click', repeatResult);
 initApiKeyUI();
 initVoiceCommands();
 initGuideToggle();
+
+// B4: destroy() termina o worker no fim de vida da página. pagehide (não
+// unload) — bfcache no iOS não dispara unload e o Safari o ignora.
+// Menor (review): sem { once: true } — após restauração de bfcache, o
+// listener precisa continuar ativo para terminar o worker no próximo fim de vida.
+addEventListener('pagehide', () => framingGuide.destroy());
 
 // -------------------------------------------------------------------------
 // Registro do Service Worker (PWA instalável)

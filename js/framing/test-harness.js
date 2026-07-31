@@ -123,9 +123,14 @@ export async function runStills(detect, opts = {}) {
   let edgeOk = 0;
   let edgeTotal = 0;
   let loadFailures = 0;
+  let discarded = 0; // B4 (review): detect() retornou null (worker não ready)
   const centerErrors = [];
+  const tilts = []; // F1: tilt médio para o relatório (insumo F2/F3)
   // Custo total por frame (drawImage + getImageData + detect), para o
   // orçamento de A8. O `ms` do resultado mede só o loop interno do detector.
+  // F1: com o worker, frameMs inclui o round-trip de postMessage + transfer,
+  // não só drawImage + getImageData + detect — não comparável com o número
+  // de F0. Desejável para o orçamento de A8, mas medir e registrar separadamente.
   let frameMsTotal = 0;
   let frameMsMin = Infinity;
   let frameMsMax = 0;
@@ -147,12 +152,19 @@ export async function runStills(detect, opts = {}) {
       loadFailures++;
       continue;
     }
-    const result = detect(imageData, width, height);
+    const result = await detect(imageData, width, height);
     const frameMs = performance.now() - frameT0;
     frameMsTotal += frameMs;
     if (frameMs < frameMsMin) frameMsMin = frameMs;
     if (frameMs > frameMsMax) frameMsMax = frameMs;
     frameCount++;
+    // B4 (review): detect() pode retornar null (worker ainda não ready).
+    // Tratar como frame descartado — nunca como resultado de detecção.
+    if (result === null) {
+      discarded++;
+      onProgress(i + 1, stills.length, s.file, null, null);
+      continue;
+    }
     const truth = s.truth || {};
     const cmp = compareStill(result, truth, width, height);
     if (cmp.foundCorrect) foundOk++;
@@ -161,21 +173,25 @@ export async function runStills(detect, opts = {}) {
       if (cmp.touchesEdgeCorrect) edgeOk++;
     }
     if (cmp.centerErrorPx !== null) centerErrors.push(cmp.centerErrorPx);
+    if (result.tilt !== undefined && result.tilt !== null) tilts.push(result.tilt);
     onProgress(i + 1, stills.length, s.file, result, cmp);
   }
 
   const n = stills.length;
-  const evaluated = n - loadFailures;
+  // B4 (review): evaluated exclui loadFailures E discarded (worker null).
+  const evaluated = n - loadFailures - discarded;
   return {
     n,
     evaluated,
     loadFailures,
+    discarded,
     foundAccuracy: evaluated ? foundOk / evaluated : 0,
     centerErrorMedPx: median(centerErrors),
     centerErrorAvgPx: centerErrors.length
       ? centerErrors.reduce((a, b) => a + b, 0) / centerErrors.length
       : null,
     touchesEdgeAccuracy: edgeTotal ? edgeOk / edgeTotal : null,
+    tiltAvg: tilts.length ? tilts.reduce((a, b) => a + b, 0) / tilts.length : null,
     frameMs: {
       avg: frameCount ? frameMsTotal / frameCount : 0,
       min: frameCount ? frameMsMin : 0,
@@ -256,7 +272,7 @@ export async function runClip(detect, clip, opts = {}) {
     const { canvas, ctx } = makeCanvas(width, height);
     ctx.drawImage(video, 0, 0, width, height);
     const imageData = ctx.getImageData(0, 0, width, height);
-    const result = detect(imageData, width, height);
+    const result = await detect(imageData, width, height);
     const frameMs = performance.now() - frameT0;
     frameMsTotal += frameMs;
     if (frameMs < frameMsMin) frameMsMin = frameMs;
@@ -294,16 +310,19 @@ export async function runClip(detect, clip, opts = {}) {
 
 /**
  * Formata um relatório de stills como texto para colar no BENCHMARK.md.
+ * F1: inclui tilt no relatório para justificar o custo de calcular (mesmo
+ * não consumido no feedback em F1 — é insumo para F2/F3).
  */
 export function formatStillsReport(r) {
   return [
     `### A1 — Detecção (stills)`,
     `- Frames no índice: ${r.n}`,
-    `- Frames avaliados: ${r.evaluated}` + (r.loadFailures ? ` (ignorados ${r.loadFailures} que falharam ao carregar)` : ''),
+    `- Frames avaliados: ${r.evaluated}` + (r.loadFailures ? ` (ignorados ${r.loadFailures} que falharam ao carregar)` : '') + (r.discarded ? ` (descartados ${r.discarded} com detect=null)` : ''),
     `- Acurácia de found: ${(r.foundAccuracy * 100).toFixed(1)}% (meta A1: ≥85%)`,
     `- Erro de centro mediano: ${r.centerErrorMedPx !== null ? r.centerErrorMedPx.toFixed(1) + ' px' : 'n/a'}`,
     `- Erro de centro médio: ${r.centerErrorAvgPx !== null ? r.centerErrorAvgPx.toFixed(1) + ' px' : 'n/a'}`,
     `- Acurácia touchesEdge: ${r.touchesEdgeAccuracy !== null ? (r.touchesEdgeAccuracy * 100).toFixed(1) + '%' : 'n/a'}`,
+    `- tilt médio: ${r.tiltAvg !== null ? r.tiltAvg.toFixed(1) + '°' : 'n/a'} (insumo F2/F3, não consumido em F1)`,
     `- ms/frame (detector): med ${r.stats.medianMs.toFixed(1)} / p95 ${r.stats.p95Ms.toFixed(1)} / avg ${r.stats.avgMs.toFixed(1)} (min ${r.stats.minMs.toFixed(1)} / max ${r.stats.maxMs.toFixed(1)})`,
     `- ms/frame (total: drawImage+getImageData+detect): med ${r.frameMs.avg.toFixed(1)} (min ${r.frameMs.min.toFixed(1)} / max ${r.frameMs.max.toFixed(1)})`,
     `- fps efetivo: ${r.stats.fps.toFixed(1)}`,
