@@ -1,0 +1,4 @@
+# Dataset de teste do guia de enquadramento (F0).
+# 50–150 MB de fotos/clipes/anotações num projeto de ~30 KB — não entra no repo.
+# O sw.js não tem early-return para ele: é gitignored e nunca deployado.
+dataset/

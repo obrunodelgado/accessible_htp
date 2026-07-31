@@ -3,6 +3,8 @@
    Fluxo: câmera -> foto -> Gemini (multimodal) -> descrição/hipóteses -> voz
    ========================================================================= */
 
+import { detect as detectSheet } from './js/framing/fallback-detector.js';
+
 const els = {
   status: document.getElementById('status'),
   resultText: document.getElementById('resultText'),
@@ -130,45 +132,6 @@ function stopGuideAudio() {
   guidePanner = null;
 }
 
-// Encontra a bounding box da região "clara" do quadro usando um limiar
-// simples baseado no brilho médio (a folha costuma ser mais clara que a
-// mesa/fundo). Retorna null se não achar contraste suficiente.
-function detectSheetBounds(imageData, width, height) {
-  const { data } = imageData;
-  let sum = 0;
-  const n = width * height;
-  for (let i = 0; i < data.length; i += 4) {
-    sum += (data[i] + data[i + 1] + data[i + 2]) / 3;
-  }
-  const mean = sum / n;
-  const threshold = mean + 20; // um pouco acima da média para pegar só o mais claro
-
-  let minX = width, minY = height, maxX = 0, maxY = 0, brightCount = 0;
-  let idx = 0;
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const b = (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
-      if (b > threshold) {
-        brightCount++;
-        if (x < minX) minX = x;
-        if (x > maxX) maxX = x;
-        if (y < minY) minY = y;
-        if (y > maxY) maxY = y;
-      }
-      idx += 4;
-    }
-  }
-
-  if (brightCount < n * 0.02) return null; // quase nada de claro: sem folha detectável
-
-  return {
-    minX, minY, maxX, maxY,
-    coverage: brightCount / n,
-    centerX: (minX + maxX) / 2 / width,
-    centerY: (minY + maxY) / 2 / height,
-  };
-}
-
 function speakGuide(text) {
   const now = performance.now();
   if (text === guideLastPhrase && now - guideLastSpokenAt < 2200) return; // evita repetição
@@ -189,13 +152,13 @@ function analyzeFrameForGuide() {
   const ctx = gCanvas.getContext('2d', { willReadFrequently: true });
   ctx.drawImage(video, 0, 0, w, h);
   const imageData = ctx.getImageData(0, 0, w, h);
-  const bounds = detectSheetBounds(imageData, w, h);
+  const result = detectSheet(imageData, w, h);
 
   ensureGuideAudio();
   if (!guideAudioCtx) return;
   const now = guideAudioCtx.currentTime;
 
-  if (!bounds) {
+  if (!result.found) {
     // Sem folha detectada: tom baixo e intermitente, sem direção
     guideGain.gain.setTargetAtTime(0.05, now, 0.1);
     guideOsc.frequency.setTargetAtTime(220, now, 0.1);
@@ -204,10 +167,10 @@ function analyzeFrameForGuide() {
     return;
   }
 
-  const dx = bounds.centerX - 0.5; // negativo = folha à esquerda do quadro
-  const dy = bounds.centerY - 0.5;
+  const dx = result.cx - 0.5; // negativo = folha à esquerda do quadro
+  const dy = result.cy - 0.5;
   const centered = Math.abs(dx) < GUIDE_CENTER_MARGIN && Math.abs(dy) < GUIDE_CENTER_MARGIN;
-  const distanceOk = bounds.coverage >= GUIDE_TARGET_COVERAGE_MIN && bounds.coverage <= GUIDE_TARGET_COVERAGE_MAX;
+  const distanceOk = result.coverage >= GUIDE_TARGET_COVERAGE_MIN && result.coverage <= GUIDE_TARGET_COVERAGE_MAX;
 
   // Balanço estéreo: acompanha o desvio horizontal da folha (-1 a 1)
   const pan = Math.max(-1, Math.min(1, dx * 2.2));
@@ -216,9 +179,9 @@ function analyzeFrameForGuide() {
   // Frequência: mais alta quando a folha está próxima do enquadramento ideal
   // (perto do centro e da cobertura alvo); mais grave quando está longe.
   let freq = 300;
-  if (bounds.coverage < GUIDE_TARGET_COVERAGE_MIN) {
+  if (result.coverage < GUIDE_TARGET_COVERAGE_MIN) {
     freq = 260; // folha pequena demais: precisa aproximar
-  } else if (bounds.coverage > GUIDE_TARGET_COVERAGE_MAX) {
+  } else if (result.coverage > GUIDE_TARGET_COVERAGE_MAX) {
     freq = 340; // folha grande demais: precisa afastar
   } else {
     freq = 500;
@@ -230,9 +193,9 @@ function analyzeFrameForGuide() {
   // Feedback falado, só quando muda a situação principal
   if (centered && distanceOk) {
     speakGuide('Centralizado e na distância certa. Pode capturar.');
-  } else if (!distanceOk && bounds.coverage < GUIDE_TARGET_COVERAGE_MIN) {
+  } else if (!distanceOk && result.coverage < GUIDE_TARGET_COVERAGE_MIN) {
     speakGuide('Aproxime a câmera da folha.');
-  } else if (!distanceOk && bounds.coverage > GUIDE_TARGET_COVERAGE_MAX) {
+  } else if (!distanceOk && result.coverage > GUIDE_TARGET_COVERAGE_MAX) {
     speakGuide('Afaste um pouco a câmera.');
   } else if (Math.abs(dx) >= GUIDE_CENTER_MARGIN) {
     speakGuide(dx < 0 ? 'Mova a câmera um pouco para a esquerda.' : 'Mova a câmera um pouco para a direita.');

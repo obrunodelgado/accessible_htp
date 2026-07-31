@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Test Harness — Guia de Enquadramento (F0)</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:#111; color:#eee;
+         padding:16px; max-width:760px; margin:0 auto; font-size:16px; }
+  h1 { font-size:20px; }
+  button { font-size:18px; padding:12px; margin:6px 0; width:100%; border-radius:10px;
+           border:2px solid #555; background:#222; color:#eee; cursor:pointer; }
+  pre { background:#000; color:#9f9; padding:12px; border-radius:8px; overflow:auto;
+        white-space:pre-wrap; font-size:13px; }
+  .progress { color:#ffcc00; font-size:14px; min-height:20px; }
+  .warn { color:#ff8855; }
+</style>
+</head>
+<body>
+<h1>Test Harness — F0 (FallbackDetector)</h1>
+
+<p class="warn">
+  Página de desenvolvimento. <strong>Não registra o Service Worker</strong>.
+  Se já existe um SW ativo controlando esta origem (registrado pelo app em
+  index.html), ele continua controlando esta página até a próxima navegação —
+  <code>unregister()</code> só impede registros futuros e não bypassa o fetch
+  handler do carregamento atual. Por isso, se um controller estiver ativo,
+  esta página desregistra e <strong>recarrega uma vez</strong> para escapar do
+  controle (o SW desregistrado não controla a nova página). O app re-registra
+  o SW na próxima visita a index.html.
+</p>
+
+<button id="runStills">Rodar stills (A1 + erro de centro)</button>
+<button id="clearLog">Limpar log</button>
+<div class="progress" id="progress"></div>
+<pre id="log">Saída aparece aqui. Certifique-se de que dataset/index.json existe (ver dataset/README.md).</pre>
+
+<script type="module">
+  // Defensivo: o app registra sw.js em index.html. Se um SW já estiver
+  // controlando esta página (navigator.serviceWorker.controller), seu fetch
+  // handler interceptaria os fetchs do dataset nesta sessão e faria cache.put.
+  // unregister() não afeta o carregamento atual — só recarregar faz o SW
+  // desregistrado parar de controlar. Recarregamos uma única vez: após o
+  // reload, controller é null e este bloco não roda de novo (sem loop).
+  //
+  // Os imports abaixo são hoisted (avaliam sempre), mas são side-effect-free;
+  // o guard `controller` impede o setup dos botões quando vamos recarregar.
+  const controlled = ('serviceWorker' in navigator) && navigator.serviceWorker.controller;
+  if (controlled) {
+    navigator.serviceWorker.getRegistrations()
+      .then((rs) => Promise.all(rs.map((r) => r.unregister())))
+      .then(() => location.reload())
+      .catch(() => {});
+  }
+
+  import { detect, getStats, resetStats } from './js/framing/fallback-detector.js';
+  import { runStills, formatStillsReport } from './js/framing/test-harness.js';
+
+  if (!controlled) {
+    const log = document.getElementById('log');
+    const progress = document.getElementById('progress');
+    const append = (s) => { log.textContent += '\n' + s; };
+
+    document.getElementById('clearLog').addEventListener('click', () => {
+      log.textContent = '';
+    });
+
+    document.getElementById('runStills').addEventListener('click', async () => {
+      progress.textContent = 'Carregando dataset/index.json...';
+      try {
+        const report = await runStills(detect, {
+          width: 160,
+          resetStats,
+          getStats,
+          onProgress: (i, n, file, result, cmp) => {
+            progress.textContent = `Processando ${i}/${n}: ${file} — found=${result.found} ok=${cmp.foundCorrect}`;
+          },
+        });
+        append(formatStillsReport(report));
+        append('\n--- stats brutos ---\n' + JSON.stringify(report.stats, null, 2));
+        progress.textContent = 'Concluído.';
+      } catch (e) {
+        progress.textContent = 'Erro.';
+        append('ERRO: ' + e.message);
+      }
+    });
+  }
+</script>
+</body>
+</html>
