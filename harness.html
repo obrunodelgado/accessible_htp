@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Test Harness — Guia de Enquadramento (F0/F1)</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:#111; color:#eee;
+         padding:16px; max-width:760px; margin:0 auto; font-size:16px; }
+  h1 { font-size:20px; }
+  button { font-size:18px; padding:12px; margin:6px 0; width:100%; border-radius:10px;
+           border:2px solid #555; background:#222; color:#eee; cursor:pointer; }
+  pre { background:#000; color:#9f9; padding:12px; border-radius:8px; overflow:auto;
+        white-space:pre-wrap; font-size:13px; }
+  .progress { color:#ffcc00; font-size:14px; min-height:20px; }
+  .warn { color:#ff8855; }
+</style>
+</head>
+<body>
+<h1>Test Harness — F0 (FallbackDetector) / F1 (Worker Otsu)</h1>
+
+<p class="warn">
+  Página de desenvolvimento. <strong>Não registra o Service Worker</strong>.
+  Se já existe um SW ativo controlando esta origem (registrado pelo app em
+  index.html), ele continua controlando esta página até a próxima navegação —
+  <code>unregister()</code> só impede registros futuros e não bypassa o fetch
+  handler do carregamento atual. Por isso, se um controller estiver ativo,
+  esta página desregistra e <strong>recarrega uma vez</strong> para escapar do
+  controle (o SW desregistrado não controla a nova página). O app re-registra
+  o SW na próxima visita a index.html.
+</p>
+
+<button id="runStills">Rodar stills — FallbackDetector (baseline A1)</button>
+<button id="runStillsWorker">Rodar stills com worker (Otsu) — gate F1</button>
+<button id="clearLog">Limpar log</button>
+<div class="progress" id="progress"></div>
+<pre id="log">Saída aparece aqui. Certifique-se de que dataset/index.json existe (ver dataset/README.md).</pre>
+
+<script type="module">
+  // Defensivo: o app registra sw.js em index.html. Se um SW já estiver
+  // controlando esta página (navigator.serviceWorker.controller), seu fetch
+  // handler interceptaria os fetchs do dataset nesta sessão e faria cache.put.
+  // unregister() não afeta o carregamento atual — só recarregar faz o SW
+  // desregistrado parar de controlar. Recarregamos uma única vez: após o
+  // reload, controller é null e este bloco não roda de novo (sem loop).
+  //
+  // Os imports abaixo são hoisted (avaliam sempre), mas são side-effect-free;
+  // o guard `controller` impede o setup dos botões quando vamos recarregar.
+  const controlled = ('serviceWorker' in navigator) && navigator.serviceWorker.controller;
+  if (controlled) {
+    navigator.serviceWorker.getRegistrations()
+      .then((rs) => Promise.all(rs.map((r) => r.unregister())))
+      .then(() => location.reload())
+      .catch(() => {});
+  }
+
+  import { detect, getStats, resetStats } from './js/framing/fallback-detector.js';
+  import { createStats } from './js/framing/stats.js';
+  import { runStills, formatStillsReport } from './js/framing/test-harness.js';
+
+  if (!controlled) {
+    const log = document.getElementById('log');
+    const progress = document.getElementById('progress');
+    const append = (s) => { log.textContent += '\n' + s; };
+
+    document.getElementById('clearLog').addEventListener('click', () => {
+      log.textContent = '';
+    });
+
+    // F0: FallbackDetector (baseline heurístico) — detect síncrono.
+    document.getElementById('runStills').addEventListener('click', async () => {
+      progress.textContent = 'Carregando dataset/index.json...';
+      try {
+        const report = await runStills(detect, {
+          width: 160,
+          resetStats,
+          getStats,
+          onProgress: (i, n, file, result, cmp) => {
+            progress.textContent = `Processando ${i}/${n}: ${file} — found=${result ? result.found : 'null'} ok=${cmp ? cmp.foundCorrect : 'descartado'}`;
+          },
+        });
+        append('=== FallbackDetector (baseline F0) ===');
+        append(formatStillsReport(report));
+        append('\n--- stats brutos ---\n' + JSON.stringify(report.stats, null, 2));
+        progress.textContent = 'Concluído.';
+      } catch (e) {
+        progress.textContent = 'Erro.';
+        append('ERRO: ' + e.message);
+      }
+    });
+
+    // F1: Worker Otsu — wrapper async do worker com createStats() próprio (B1).
+    // O worker é reusado entre frames (não cria um novo por frame).
+    // Stats no main thread: o result traz ms+found; o wrapper chama
+    // stats.record(ms, found). getStats/resetStats são síncronos, sem round-trip.
+    //
+    // B4 (review): a Promise `readyPromise` resolve no handler de 'ready'
+    // (sem timeout fixo), com timeout longo só como erro. Antes, um
+    // setTimeout(3000) resolvia incondicionalmente e o polling era morto.
+    let workerWrapper = null;
+    function getWorkerWrapper() {
+      if (workerWrapper) return workerWrapper;
+      const stats = createStats();
+      const worker = new Worker(new URL('./js/framing/frame-worker.js', location.href));
+      let ready = false;
+      let pendingResolve = null;
+      // readyPromise resolve quando o worker posta 'ready'. Rejeita em erro
+      // fatal ou timeout (60s — OpenCV ~10 MB em 3G pode levar isso).
+      let readyResolve, readyReject;
+      const readyPromise = new Promise((res, rej) => { readyResolve = res; readyReject = rej; });
+      const readyTimer = setTimeout(() => readyReject(new Error('worker ready timeout (60s)')), 60000);
+      worker.onmessage = (e) => {
+        const msg = e.data;
+        if (!msg) return;
+        if (msg.type === 'ready') {
+          ready = true;
+          clearTimeout(readyTimer);
+          append('[worker] ready');
+          readyResolve();
+        } else if (msg.type === 'result') {
+          stats.record(msg.ms, msg.found);
+          if (pendingResolve) { const r = pendingResolve; pendingResolve = null; r(msg); }
+        } else if (msg.type === 'notready') {
+          // B2: worker ainda inicializando — resolve com null (caller descarta).
+          if (pendingResolve) { const r = pendingResolve; pendingResolve = null; r(null); }
+        } else if (msg.type === 'error') {
+          append('[worker] error: ' + msg.message);
+          if (!ready) { clearTimeout(readyTimer); readyReject(new Error(msg.message)); }
+          if (pendingResolve) { const r = pendingResolve; pendingResolve = null; r(null); }
+        }
+      };
+      worker.onerror = (e) => {
+        append('[worker] onerror: ' + (e.message || e));
+        if (!ready) { clearTimeout(readyTimer); readyReject(new Error(e.message || 'worker error')); }
+        if (pendingResolve) { const r = pendingResolve; pendingResolve = null; r(null); }
+      };
+      // detect(imageData, w, h) retorna Promise (FallbackDetector é síncrono,
+      // envolvido em Promise.resolve para a mesma interface).
+      const detect = (imageData, w, h) => new Promise((resolve) => {
+        if (!ready) { resolve(null); return; }
+        pendingResolve = resolve;
+        worker.postMessage(
+          { type: 'frame', width: w, height: h, buffer: imageData.data.buffer },
+          [imageData.data.buffer]
+        );
+      });
+      workerWrapper = { detect, readyPromise, getStats: () => stats.get(), resetStats: () => stats.reset() };
+      return workerWrapper;
+    }
+
+    document.getElementById('runStillsWorker').addEventListener('click', async () => {
+      progress.textContent = 'Iniciando worker (carrega OpenCV.js ~10 MB)...';
+      try {
+        const w = getWorkerWrapper();
+        // B4 (review): espera o ready de verdade (Promise), não setTimeout.
+        progress.textContent = 'Aguardando worker ready (carregando OpenCV.js)...';
+        await w.readyPromise;
+        progress.textContent = 'Worker ready. Carregando dataset...';
+        const report = await runStills(w.detect, {
+          width: 160,
+          resetStats: w.resetStats,
+          getStats: w.getStats,
+          onProgress: (i, n, file, result, cmp) => {
+            progress.textContent = `Processando ${i}/${n}: ${file} — found=${result ? result.found : 'null'} ok=${cmp ? cmp.foundCorrect : 'descartado'}`;
+          },
+        });
+        append('=== Worker Otsu (F1) ===');
+        append(formatStillsReport(report));
+        append('\n--- stats brutos ---\n' + JSON.stringify(report.stats, null, 2));
+        progress.textContent = 'Concluído.';
+      } catch (e) {
+        progress.textContent = 'Erro.';
+        append('ERRO: ' + e.message);
+      }
+    });
+  }
+</script>
+</body>
+</html>
