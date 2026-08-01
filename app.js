@@ -175,7 +175,7 @@ async function startCamera() {
     els.camera.srcObject = mediaStream;
     els.camera.classList.add('active');
     sounds.action();
-    setStatus('Câmera ativada. Toque novamente no botão para capturar a foto.', 'idle');
+    setStatus('Posicione a folha em frente à câmera.', 'idle');
     els.captureBtn.textContent = '📸 Capturar agora';
     els.captureBtn.setAttribute('aria-label', 'Capturar foto agora');
     startFramingGuide();

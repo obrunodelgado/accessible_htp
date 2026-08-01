@@ -474,7 +474,7 @@ export class FramingGuide {
     // Prioridade GUIDE (mesma das direções). Não preempcta STATUS, mas a
     // frase é diferente das direções repetidas — passa pela fila sem
     // ser suprimida pelo cooldown de frase idêntica do audio.js.
-    queue.speak('Não consigo enquadrar. Aproxime a folha da câmera.', PRIORITY.GUIDE);
+    queue.speak('Não consigo enquadrar. Afaste a câmera da folha.', PRIORITY.GUIDE);
   }
 
   /**
