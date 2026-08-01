@@ -2,3 +2,13 @@
 # 50–150 MB de fotos/clipes/anotações num projeto de ~30 KB — não entra no repo.
 # O sw.js não tem early-return para ele: é gitignored e nunca deployado.
 dataset/
+
+# Dev tooling para o gate F0 (proxy Node do baseline). Não é parte do app.
+node_modules/
+scripts/
+
+# Artefatos de treino YOLO (pesos .pt, runs, exportações intermediárias).
+yolov8n.pt
+runs/
+package.json
+package-lock.json

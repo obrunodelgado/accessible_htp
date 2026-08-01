@@ -52,6 +52,14 @@ export class SpeechQueue {
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.lang = 'pt-BR';
     utterance.rate = 1;
+    // Seleciona voz pt-BR se disponível (Chrome carrega assíncrono — pode
+    // ainda não estar pronto no primeiro speak, mas tenta a cada chamada).
+    const voices = speechSynthesis.getVoices();
+    if (voices && voices.length) {
+      const ptVoice = voices.find(v => v.lang === 'pt-BR')
+        || voices.find(v => v.lang && v.lang.startsWith('pt'));
+      if (ptVoice) utterance.voice = ptVoice;
+    }
     const entry = { text, priority, utterance };
 
     // Preempção: novo tem prioridade maior (número menor) que o current.
@@ -138,16 +146,56 @@ export class SpeechQueue {
       this._speaking = false;
       this._pump();
     };
-    entry.utterance.onerror = () => {
+    entry.utterance.onerror = (e) => {
       if (this.current !== entry) return;
       this.current = null;
       this._speaking = false;
       this._pump();
     };
 
+    // Chrome bug: speechSynthesis pode estar travado em speaking:true de
+    // uma sessão anterior, mesmo após cancel() na inicialização. Se
+    // speaking:true mas nós não temos current (não fomos nós que iniciamos),
+    // cancela e re-tenta no próximo tick (cancel é assíncrono no Chrome).
+    if (speechSynthesis.speaking && !this.current) {
+      try { speechSynthesis.cancel(); } catch (e) {}
+      this.queue.push(entry);
+      setTimeout(() => { this._speaking = false; this._pump(); }, 50);
+      return;
+    }
+
     speechSynthesis.speak(entry.utterance);
+
+    // Chrome bug: speechSynthesis para de disparar onend após ~15s de uso
+    // contínuo, travando a fila. resume() a cada speak() contorna isso.
+    // Referência: https://stackoverflow.com/questions/21947730
+    if (speechSynthesis.paused) {
+      try { speechSynthesis.resume(); } catch (e) {}
+    }
   }
 }
 
 // Singleton compartilhado entre app.js (STATUS) e guide.js/audio.js (GUIDE).
 export const queue = new SpeechQueue();
+
+// -------------------------------------------------------------------------
+// Inicialização de vozes — Chrome/Safari carregam getVoices() de forma
+// assíncrona (vazio até o evento voiceschanged disparar). Sem voz pt-BR
+// carregada, speak() pode falhar silenciosamente. Forçamos o carregamento.
+// -------------------------------------------------------------------------
+if (typeof speechSynthesis !== 'undefined') {
+  // Chrome bug: speechSynthesis pode iniciar num estado "speaking: true"
+  // travado de uma sessão/tab anterior. O primeiro speak() fica preso sem
+  // onend/onerror e nunca toca. cancel() limpa o estado.
+  try { speechSynthesis.cancel(); } catch (e) {}
+
+  // Trigger inicial do carregamento de vozes (Chrome: vazio até o evento).
+  speechSynthesis.getVoices();
+  if (typeof speechSynthesis.onvoiceschanged !== 'undefined') {
+    speechSynthesis.onvoiceschanged = () => {
+      const voices = speechSynthesis.getVoices();
+      console.log('[SpeechQueue] vozes carregadas:', voices.length,
+        '| pt-BR:', voices.filter(v => v.lang && v.lang.startsWith('pt')).length);
+    };
+  }
+}

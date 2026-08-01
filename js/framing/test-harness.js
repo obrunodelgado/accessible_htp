@@ -93,6 +93,15 @@ function median(arr) {
 }
 
 /**
+ * Percentil 95 de um array de números.
+ */
+function p95(arr) {
+  if (!arr.length) return null;
+  const s = [...arr].sort((a, b) => a - b);
+  return s[Math.min(s.length - 1, Math.floor(s.length * 0.95))];
+}
+
+/**
  * Roda o detector sobre todos os stills do dataset e reporta A1 + erro de
  * centro. Aceita `detect` injetado (F0: FallbackDetector; F1: worker).
  *
@@ -126,6 +135,10 @@ export async function runStills(detect, opts = {}) {
   let discarded = 0; // B4 (review): detect() retornou null (worker não ready)
   const centerErrors = [];
   const tilts = []; // F1: tilt médio para o relatório (insumo F2/F3)
+  // F2: distribuição de modos (otsu/adaptive/canny/heuristic) e score do
+  // candidato escolhido (mediana + p95), quando os campos existirem.
+  const modeCounts = {};
+  const scores = [];
   // Custo total por frame (drawImage + getImageData + detect), para o
   // orçamento de A8. O `ms` do resultado mede só o loop interno do detector.
   // F1: com o worker, frameMs inclui o round-trip de postMessage + transfer,
@@ -174,6 +187,10 @@ export async function runStills(detect, opts = {}) {
     }
     if (cmp.centerErrorPx !== null) centerErrors.push(cmp.centerErrorPx);
     if (result.tilt !== undefined && result.tilt !== null) tilts.push(result.tilt);
+    if (result.mode) modeCounts[result.mode] = (modeCounts[result.mode] || 0) + 1;
+    if (typeof result.score === 'number') scores.push(result.score);
+    // F2: result.mode disponível no callback (diagnóstico de quando a
+    // cascata foi acionada).
     onProgress(i + 1, stills.length, s.file, result, cmp);
   }
 
@@ -192,6 +209,9 @@ export async function runStills(detect, opts = {}) {
       : null,
     touchesEdgeAccuracy: edgeTotal ? edgeOk / edgeTotal : null,
     tiltAvg: tilts.length ? tilts.reduce((a, b) => a + b, 0) / tilts.length : null,
+    modes: modeCounts,
+    scoreMedian: median(scores),
+    scoreP95: p95(scores),
     frameMs: {
       avg: frameCount ? frameMsTotal / frameCount : 0,
       min: frameCount ? frameMsMin : 0,
@@ -314,7 +334,7 @@ export async function runClip(detect, clip, opts = {}) {
  * não consumido no feedback em F1 — é insumo para F2/F3).
  */
 export function formatStillsReport(r) {
-  return [
+  const lines = [
     `### A1 — Detecção (stills)`,
     `- Frames no índice: ${r.n}`,
     `- Frames avaliados: ${r.evaluated}` + (r.loadFailures ? ` (ignorados ${r.loadFailures} que falharam ao carregar)` : '') + (r.discarded ? ` (descartados ${r.discarded} com detect=null)` : ''),
@@ -326,5 +346,13 @@ export function formatStillsReport(r) {
     `- ms/frame (detector): med ${r.stats.medianMs.toFixed(1)} / p95 ${r.stats.p95Ms.toFixed(1)} / avg ${r.stats.avgMs.toFixed(1)} (min ${r.stats.minMs.toFixed(1)} / max ${r.stats.maxMs.toFixed(1)})`,
     `- ms/frame (total: drawImage+getImageData+detect): med ${r.frameMs.avg.toFixed(1)} (min ${r.frameMs.min.toFixed(1)} / max ${r.frameMs.max.toFixed(1)})`,
     `- fps efetivo: ${r.stats.fps.toFixed(1)}`,
-  ].join('\n');
+  ];
+  // F2: distribuição de modos e score (só quando a fonte reporta os campos).
+  if (r.modes && Object.keys(r.modes).length) {
+    lines.push(`- Distribuição de modos: ${Object.entries(r.modes).map(([m, c]) => `${m}=${c}`).join(', ')}`);
+  }
+  if (r.scoreMedian !== null && r.scoreMedian !== undefined) {
+    lines.push(`- Score: mediano ${r.scoreMedian.toFixed(3)} / p95 ${r.scoreP95.toFixed(3)} (found = score ≥ 0.45)`);
+  }
+  return lines.join('\n');
 }

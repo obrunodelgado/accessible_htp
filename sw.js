@@ -1,18 +1,19 @@
 /* =========================================================================
-   Service Worker — Leitor de Desenho Projetivo (F1, passo 7)
+   Service Worker — Leitor de Desenho Projetivo (F3: YOLO detector)
 
    Dois caches:
-   - APP_CACHE (leitor-desenho-v3): app shell. Bump a cada release do app.
-   - VENDOR_CACHE (leitor-vendor-v1): vendor/ (OpenCV.js). Path versionado
-     = imutável por construção. Activate limpa só prefixo leitor-desenho-,
-     preservando o vendor cache entre bumps (8 MB re-download em 3G evitado).
+   - APP_CACHE (leitor-desenho-v5): app shell. Bump a cada release do app.
+   - VENDOR_CACHE (leitor-vendor-v2): vendor/ (ONNX runtime + modelo YOLO).
+     Path versionado = imutável por construção. Activate limpa só prefixo
+     leitor-desenho-, preservando o vendor cache entre bumps.
 
    Rota cache-first para vendor/ (ancorada no scope, como DATASET_PATH):
-   o OpenCV.js é ~10 MB e versionado no path — não há razão para network-first.
+   onnxruntime-web (~30 MB wasm) + modelo YOLO (12 MB) são versionados no
+   path — não há razão para network-first.
    ========================================================================= */
 
-const APP_CACHE = 'leitor-desenho-v3';
-const VENDOR_CACHE = 'leitor-vendor-v1';
+const APP_CACHE = 'leitor-desenho-v5'; // v5: F3 (YOLO detector principal)
+const VENDOR_CACHE = 'leitor-vendor-v2'; // v2: ort.min.js + wasm + paper-yolov8n.onnx
 
 const ASSETS = [
   './',
@@ -23,12 +24,15 @@ const ASSETS = [
   './js/framing/fallback-detector.js',
   './js/framing/guide.js',
   './js/framing/audio.js',
-  './js/framing/frame-worker.js', // modo de precisão sobe offline
+  './js/framing/yolo-worker.js', // F3: YOLO detector (detector principal)
+  './js/framing/frame-worker.js', // F2: fallback OpenCV (mantido para robustez)
+  './js/framing/score.js', // F2: importScripts do frame-worker (fallback)
   './manifest.json',
   './icon-192.png',
   './icon-512.png',
-  // Não adicionar: vendor/opencv-*.js (rota cache-first própria, 10 MB),
-  // test-harness.js (dev), stabilizer.js/haptics.js (F3/F5, ainda não existem).
+  // Não adicionar: vendor/ort.min.js + *.wasm + paper-yolov8n.onnx
+  // (rota cache-first própria, ~42 MB total — precache em install seria lento).
+  // Não adicionar: test-harness.js (dev), stabilizer.js/haptics.js (F3/F5).
 ];
 
 self.addEventListener('install', (event) => {
@@ -43,9 +47,9 @@ self.addEventListener('install', (event) => {
 });
 
 self.addEventListener('activate', (event) => {
-  // Limpa só caches com prefixo leitor-desenho- — preserva leitor-vendor-v1.
-  // Sem isso, cada bump (v3→v4→v5…) joga fora os 10 MB do OpenCV e força
-  // re-download em 3G.
+  // Limpa só caches com prefixo leitor-desenho- — preserva leitor-vendor-*.
+  // Sem isso, cada bump (v4→v5→v6…) joga fora os ~42 MB do vendor (ONNX
+  // runtime + modelo YOLO) e força re-download em 3G.
   event.waitUntil(
     caches.keys().then((keys) =>
       Promise.all(

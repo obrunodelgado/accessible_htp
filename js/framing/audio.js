@@ -23,13 +23,26 @@ import { queue, PRIORITY } from '../speech.js';
 
 // Faixa de cobertura da folha em relação ao quadro considerada boa distância.
 // Migradas do app.js (GUIDE_TARGET_COVERAGE_MIN/MAX, GUIDE_CENTER_MARGIN).
-const TARGET_COVERAGE_MIN = 0.30;
-const TARGET_COVERAGE_MAX = 0.65;
-const CENTER_MARGIN = 0.08; // ~8% do quadro contado como "centralizado"
+// Exportadas para guide.js (UX fallback: detectar "ready" sem duplicar valores).
+export const TARGET_COVERAGE_MIN = 0.30;
+export const TARGET_COVERAGE_MAX = 0.65;
+export const CENTER_MARGIN = 0.08; // ~8% do quadro contado como "centralizado"
 
 // Cooldown de TTS do guia: suprime frase idêntica por ~2s. NÃO bloqueia
 // mudança de estado — só evita repetir a mesma frase em rajada.
 const TTS_COOLDOWN_MS = 2200;
+// Cooldown específico para "Folha não encontrada" — o usuário sem folha
+// não precisa ouvir isso a cada 3s. 8s é suficiente para não ser irritante
+// mas ainda informar se a folha saiu do quadro.
+const TTS_NOT_FOUND_COOLDOWN_MS = 8000;
+// Cooldown GLOBAL entre qualquer frase do guia (não só idêntica). Sem isso,
+// o detector oscila entre "Câmera para cima" e "Pronto" a cada frame e o
+// usuário ouve as duas frases em rajada (o cooldown idêntico não impede
+// porque são frases DIFERENTES). 3s = tempo mínimo entre direções.
+const TTS_GLOBAL_COOLDOWN_MS = 3000;
+// Lock de "Pronto": uma vez dito, segura por 5s antes de permitir outra
+// direção. Evita "Pronto → Câmera para cima → Pronto" em oscilação.
+const READY_LOCK_MS = 5000;
 
 class AudioFeedback {
   constructor() {
@@ -40,6 +53,8 @@ class AudioFeedback {
     this._active = false; // guia rodando (start chamado, stop não)
     this._lastPhrase = '';
     this._lastSpokenAt = 0;
+    this._lastAnySpokenAt = 0; // cooldown global entre qualquer frase
+    this._readyLockUntil = 0;  // lock após "Pronto" — segura por READY_LOCK_MS
   }
 
   /**
@@ -87,12 +102,13 @@ class AudioFeedback {
    */
   update(m) {
     if (!this.ctx || !this._active) return;
+    // F3: feedback apenas por voz — oscilador removido (buzz irritante).
+    // O tom contínuo era confuso para o usuário cego. Voz é mais claro.
     const now = this.ctx.currentTime;
 
     if (!m.found) {
-      // Sem folha detectada: tom baixo, sem direção
-      this.gain.gain.setTargetAtTime(0.05, now, 0.1);
-      this.osc.frequency.setTargetAtTime(220, now, 0.1);
+      // Sem folha: silencia tom (defensivo — gain já é 0, mas garante).
+      this.gain.gain.setTargetAtTime(0, now, 0.1);
       if (this.panner) this.panner.pan.setTargetAtTime(0, now, 0.1);
       this._speakGuide('Folha não encontrada.');
       return;
@@ -103,34 +119,30 @@ class AudioFeedback {
     const centered = Math.abs(dx) < CENTER_MARGIN && Math.abs(dy) < CENTER_MARGIN;
     const distanceOk = m.coverage >= TARGET_COVERAGE_MIN && m.coverage <= TARGET_COVERAGE_MAX;
 
-    // Balanço estéreo: acompanha o desvio horizontal da folha (-1 a 1)
+    // Pan estéreo mantido (acompanha folha — feedback sutil, não irritante).
     const pan = Math.max(-1, Math.min(1, dx * 2.2));
     if (this.panner) this.panner.pan.setTargetAtTime(pan, now, 0.08);
 
-    // Frequência: mais alta quando a folha está próxima do enquadramento ideal.
-    let freq = 300;
-    if (m.coverage < TARGET_COVERAGE_MIN) {
-      freq = 260; // folha pequena demais: precisa aproximar
-    } else if (m.coverage > TARGET_COVERAGE_MAX) {
-      freq = 340; // folha grande demais: precisa afastar
-    } else {
-      freq = 500;
-    }
-    if (centered && distanceOk) freq = 880; // tom agudo e estável = pronto
-    this.osc.frequency.setTargetAtTime(freq, now, 0.08);
-    this.gain.gain.setTargetAtTime(centered && distanceOk ? 0.12 : 0.08, now, 0.08);
+    // Tom desligado — feedback só por voz.
+    this.gain.gain.setTargetAtTime(0, now, 0.08);
 
     // Feedback falado — frases curtas padronizadas (≤5 palavras)
+    // Lock de "Pronto": se disse "Pronto" há menos de READY_LOCK_MS, não
+    // diz outra direção (evita oscilação Pronto→direção→Pronto).
+    const nowMs = performance.now();
+    const inReadyLock = nowMs < this._readyLockUntil;
     if (centered && distanceOk) {
       this._speakGuide('Pronto, pode capturar.');
-    } else if (!distanceOk && m.coverage < TARGET_COVERAGE_MIN) {
-      this._speakGuide('Aproxime.');
-    } else if (!distanceOk && m.coverage > TARGET_COVERAGE_MAX) {
-      this._speakGuide('Afaste.');
-    } else if (Math.abs(dx) >= CENTER_MARGIN) {
-      this._speakGuide(dx < 0 ? 'Câmera para a esquerda.' : 'Câmera para a direita.');
-    } else if (Math.abs(dy) >= CENTER_MARGIN) {
-      this._speakGuide(dy < 0 ? 'Câmera para cima.' : 'Câmera para baixo.');
+    } else if (!inReadyLock) {
+      if (!distanceOk && m.coverage < TARGET_COVERAGE_MIN) {
+        this._speakGuide('Aproxime.');
+      } else if (!distanceOk && m.coverage > TARGET_COVERAGE_MAX) {
+        this._speakGuide('Afaste.');
+      } else if (Math.abs(dx) >= CENTER_MARGIN) {
+        this._speakGuide(dx < 0 ? 'Câmera para a esquerda.' : 'Câmera para a direita.');
+      } else if (Math.abs(dy) >= CENTER_MARGIN) {
+        this._speakGuide(dy < 0 ? 'Câmera para cima.' : 'Câmera para baixo.');
+      }
     }
   }
 
@@ -147,6 +159,11 @@ class AudioFeedback {
     if (this.gain && this.ctx) {
       try { this.gain.gain.setValueAtTime(0, this.ctx.currentTime); } catch (e) { /* noop */ }
     }
+    // Reseta cooldowns/lock ao iniciar (não herdar de sessão anterior).
+    this._lastPhrase = '';
+    this._lastSpokenAt = 0;
+    this._lastAnySpokenAt = 0;
+    this._readyLockUntil = 0;
   }
 
   /**
@@ -199,17 +216,36 @@ class AudioFeedback {
   }
 
   /**
-   * Fala do guia com cooldown de ~2s suprime repetição idêntica. NÃO bloqueia
-   * mudança de estado — só evita repetir a mesma frase em rajada.
-   * Usa prioridade GUIDE (1) na fila compartilhada.
+   * Fala do guia com dois níveis de cooldown:
+   * 1. Cooldown idêntico (~2s): suprime a MESMA frase em rajada.
+   * 2. Cooldown global (~3s): tempo mínimo entre QUALQUER frase do guia,
+   *    evitando "Câmera para cima → Pronto → Câmera para cima" em oscilação.
+   * "Pronto, pode capturar." ignora o cooldown global (é a frase mais
+   * importante — o usuário precisa saber que pode capturar) e ativa o
+   * ready-lock (segura direções por 5s).
    * @param {string} text
    * @private
    */
   _speakGuide(text) {
     const now = performance.now();
-    if (text === this._lastPhrase && now - this._lastSpokenAt < TTS_COOLDOWN_MS) return;
+    // Cooldown idêntico: mesma frase dentro do cooldown → suprime.
+    // "Folha não encontrada" tem cooldown maior (8s) — não irrita o usuário.
+    const isNotFound = text === 'Folha não encontrada.';
+    const identicalCooldown = isNotFound ? TTS_NOT_FOUND_COOLDOWN_MS : TTS_COOLDOWN_MS;
+    if (text === this._lastPhrase && now - this._lastSpokenAt < identicalCooldown) return;
+
+    const isReady = text === 'Pronto, pode capturar.';
+    // Cooldown global: qualquer frase não-ready dentro de 3s da última → suprime.
+    // Ready passa direto (prioridade máxima do guia).
+    if (!isReady && now - this._lastAnySpokenAt < TTS_GLOBAL_COOLDOWN_MS) return;
+
     this._lastSpokenAt = now;
     this._lastPhrase = text;
+    this._lastAnySpokenAt = now;
+    if (isReady) {
+      // Lock: após "Pronto", segura direções por 5s mesmo se o detector oscilar.
+      this._readyLockUntil = now + READY_LOCK_MS;
+    }
     queue.speak(text, PRIORITY.GUIDE);
   }
 }

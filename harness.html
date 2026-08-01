@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Test Harness — Guia de Enquadramento (F0/F1)</title>
+<title>Test Harness — Guia de Enquadramento (F0/F1/F2)</title>
 <style>
   body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:#111; color:#eee;
          padding:16px; max-width:760px; margin:0 auto; font-size:16px; }
@@ -17,7 +17,7 @@
 </style>
 </head>
 <body>
-<h1>Test Harness — F0 (FallbackDetector) / F1 (Worker Otsu)</h1>
+<h1>Test Harness — F0 (FallbackDetector) / F1 (Worker Otsu) / F2 (Cascata + Score)</h1>
 
 <p class="warn">
   Página de desenvolvimento. <strong>Não registra o Service Worker</strong>.
@@ -31,11 +31,16 @@
 </p>
 
 <button id="runStills">Rodar stills — FallbackDetector (baseline A1)</button>
-<button id="runStillsWorker">Rodar stills com worker (Otsu) — gate F1</button>
+<button id="runStillsWorker">Rodar stills com worker (Otsu + score, cascata OFF) — F1</button>
+<button id="runStillsCascade">Rodar stills com worker (cascata Otsu→adaptive→Canny) — F2</button>
+<button id="runScoreTests">Testar score puro (ScoreLib.runSelfTests)</button>
 <button id="clearLog">Limpar log</button>
 <div class="progress" id="progress"></div>
 <pre id="log">Saída aparece aqui. Certifique-se de que dataset/index.json existe (ver dataset/README.md).</pre>
 
+<!-- F2: helper puro do score como script CLÁSSICO (mesmo arquivo que o
+     worker carrega via importScripts). Expõe window.ScoreLib. -->
+<script src="js/framing/score.js"></script>
 <script type="module">
   // Defensivo: o app registra sw.js em index.html. Se um SW já estiver
   // controlando esta página (navigator.serviceWorker.controller), seu fetch
@@ -144,27 +149,37 @@
           [imageData.data.buffer]
         );
       });
-      workerWrapper = { detect, readyPromise, getStats: () => stats.get(), resetStats: () => stats.reset() };
+      // F2: envia { type:'config', cascadeEnabled } ao worker reutilizado —
+      // permite alternar F1 (false) e F2 (true) sem destruir o worker.
+      const setConfig = (cascadeEnabled) => {
+        worker.postMessage({ type: 'config', cascadeEnabled: !!cascadeEnabled });
+      };
+      workerWrapper = { detect, readyPromise, setConfig, getStats: () => stats.get(), resetStats: () => stats.reset() };
       return workerWrapper;
     }
 
-    document.getElementById('runStillsWorker').addEventListener('click', async () => {
+    // Execução comum F1/F2: mesmo worker, mesma resolução, mesmo índice e
+    // mesmas anotações — só muda a flag cascadeEnabled (comparação honesta).
+    async function runWorkerStills(cascadeEnabled, label) {
       progress.textContent = 'Iniciando worker (carrega OpenCV.js ~10 MB)...';
       try {
         const w = getWorkerWrapper();
         // B4 (review): espera o ready de verdade (Promise), não setTimeout.
         progress.textContent = 'Aguardando worker ready (carregando OpenCV.js)...';
         await w.readyPromise;
+        w.setConfig(cascadeEnabled);
         progress.textContent = 'Worker ready. Carregando dataset...';
         const report = await runStills(w.detect, {
           width: 160,
           resetStats: w.resetStats,
           getStats: w.getStats,
           onProgress: (i, n, file, result, cmp) => {
-            progress.textContent = `Processando ${i}/${n}: ${file} — found=${result ? result.found : 'null'} ok=${cmp ? cmp.foundCorrect : 'descartado'}`;
+            const mode = result && result.mode ? ` mode=${result.mode}` : '';
+            const score = result && typeof result.score === 'number' ? ` score=${result.score.toFixed(2)}` : '';
+            progress.textContent = `Processando ${i}/${n}: ${file} — found=${result ? result.found : 'null'}${mode}${score} ok=${cmp ? cmp.foundCorrect : 'descartado'}`;
           },
         });
-        append('=== Worker Otsu (F1) ===');
+        append(`=== ${label} ===`);
         append(formatStillsReport(report));
         append('\n--- stats brutos ---\n' + JSON.stringify(report.stats, null, 2));
         progress.textContent = 'Concluído.';
@@ -172,6 +187,26 @@
         progress.textContent = 'Erro.';
         append('ERRO: ' + e.message);
       }
+    }
+
+    document.getElementById('runStillsWorker').addEventListener('click', () =>
+      runWorkerStills(false, 'Worker Otsu + score, cascata OFF (F1/F2 score-only)'));
+
+    document.getElementById('runStillsCascade').addEventListener('click', () =>
+      runWorkerStills(true, 'Worker cascata Otsu→adaptive→Canny (F2)'));
+
+    // F2: teste unitário puro do ScoreLib (sem dataset, OpenCV ou Worker).
+    document.getElementById('runScoreTests').addEventListener('click', () => {
+      const lib = window.ScoreLib || globalThis.ScoreLib;
+      if (!lib) {
+        append('ERRO: ScoreLib não carregado (js/framing/score.js).');
+        return;
+      }
+      const r = lib.runSelfTests();
+      append('=== ScoreLib self-tests ===');
+      append(`Passaram: ${r.passed}, falharam: ${r.failed}`);
+      for (const f of r.failures) append(`  FALHOU: ${f}`);
+      progress.textContent = r.failed ? 'Testes de score com FALHAS.' : 'Testes de score OK.';
     });
   }
 </script>

@@ -20,20 +20,56 @@
 
 import { detect as fallbackDetect, _stats as fallbackStats } from './fallback-detector.js';
 import { createStats } from './stats.js';
-import { audio } from './audio.js';
+import { audio, TARGET_COVERAGE_MIN, TARGET_COVERAGE_MAX, CENTER_MARGIN } from './audio.js';
 import { queue, PRIORITY } from '../speech.js';
 
+// Modos válidos do worker: 'yolo' (detector principal F3), 'otsu'/'adaptive'/
+// 'canny' (pipeline OpenCV F2 — fallback). 'heuristic' é o FallbackDetector.
+const WORKER_MODES = new Set(['yolo', 'otsu', 'adaptive', 'canny']);
+
+// UX fallback (F2b): timeout de ajuda. Se o usuário não atinge "ready"
+// (found + centralizado + cobertura na faixa) em STUCK_TIMEOUT_MS, o guia
+// sugere "aproxime a folha". Repete a cada HELP_COOLDOWN_MS se continuar
+// sem ready. Reseta quando ready é atingido.
+//
+// Motivação: o detector tem especificidade ~0% (falsos retângulos do fundo
+// pontuam como folha). O usuário segue direções para centralizar um
+// retângulo inexistente e nunca atinge "Pronto". O timeout é a defesa de
+// UX — não resolve a especificidade, mas evita que o usuário fique preso
+// seguindo direções para o vazio. Validado como necessário pelo gate F2
+// (dataset 73:30, acurácia 69.9%, 0/30 negativos corretos).
+const STUCK_TIMEOUT_MS = 15000;   // 15s sem ready → primeira ajuda
+const HELP_COOLDOWN_MS = 12000;   // repete a cada 12s se continuar stuck
+
+// Histerese temporal (estabilizador simples pré-F3): o YOLO pode oscilar
+// entre found=true/false entre frames adjacentes (falsos positivos
+// transitórios em alguns frames). Exigir N frames consecutivos com
+// found=true antes de reportar found=true ao áudio evita "Pronto" em
+// rajada. Reset no primeiro found=false.
+const FOUND_HOLD_FRAMES = 3;
+
 // Throttle adaptativo (F1 conservador; refinamento é F6).
+// YOLO: inference ~63ms desktop, ~150-300ms estimado Moto E. O throttle
+// padrão de 450ms acomoda o YOLO com folga no desktop; no Moto E pode
+// subir para 700ms (INTERVAL_MAX). Os thresholds são conservadores.
 const INTERVAL_DEFAULT = 450;
-const INTERVAL_MAX = 700;
+const INTERVAL_MAX = 800;
 const INTERVAL_MIN = 300;
-const MS_THRESHOLD_UP = 120; // >120ms → aumenta intervalo (defesa < A2 150ms)
-const MS_THRESHOLD_DOWN = 40; // <40ms → permite intervalo menor
-const WIDTH_DEFAULT = 160;
+const MS_THRESHOLD_UP = 350; // YOLO é mais lento que OpenCV — threshold maior
+const MS_THRESHOLD_DOWN = 80; // YOLO rápido → permite intervalo menor
+const WIDTH_DEFAULT = 160;   // largura do canvas de captura (não afeta YOLO)
 const WIDTH_MIN = 120;
 
 export class FramingGuide {
-  constructor() {
+  /**
+   * @param {{conf?: number, onStatus?: function}} [opts] YOLO: limiar de
+   *   confiança da detecção (default 0.35 — gate browser validado: 99%
+   *   acurácia, 96.7% espec). onStatus: callback para reportar status do
+   *   detector (para debug visual no front).
+   */
+  constructor(opts = {}) {
+    this.conf = opts.conf || 0.35;
+    this.onStatus = opts.onStatus || null;
     this.video = null;
     this.canvas = null;
     this.ctx = null;
@@ -67,6 +103,23 @@ export class FramingGuide {
     // Instrumentação: tempo desde start() até ready (gate de carga de F6).
     this._startAt = 0;
     this._firstResultHeap = 0; // gate de A4
+
+    // UX fallback (F2b): tracking de "ready" e timeout de ajuda.
+    this._lastReadyMs = 0;       // último momento em que metrics eram "ready"
+    this._lastHelpMs = 0;        // último momento em que a ajuda foi falada
+    this._helpPending = false;  // já passou do timeout mas ainda não falou
+
+    // Histerese temporal: contador de frames consecutivos com found=true.
+    this._foundStreak = 0;
+
+    // Pré-carregamento: cria o worker imediatamente no construtor para
+    // baixar o modelo ONNX (12MB) em background, sem esperar o usuário
+    // clicar na câmera. O worker emite 'ready' quando o modelo carrega;
+    // o guia só começa a enviar frames no start().
+    if (!this.worker && !this.workerFailed) {
+      this._createWorker();
+      if (this.onStatus) this.onStatus({ detector: 'yolo', state: 'loading' });
+    }
   }
 
   /**
@@ -94,15 +147,20 @@ export class FramingGuide {
     this.interval = INTERVAL_DEFAULT;
     this.inFlight = false;
 
-    // Worker: reusa se existe e está ready; cria se não existe ou foi
-    // terminado por erro fatal (B4).
-    if (!this.worker && !this.workerFailed) {
-      this._createWorker();
-    } else if (this.worker && this.workerReady) {
-      // Worker já ready de toggle anterior — troca fonte imediatamente.
+    // UX fallback: reseta tracking de ready/help a cada start().
+    this._lastReadyMs = this._startAt;
+    this._lastHelpMs = 0;
+    this._helpPending = false;
+
+    // Worker: já foi criado no construtor (pré-carregamento). Se falhou
+    // antes, fica no fallback. Se já está ready, troca fonte imediatamente.
+    if (this.worker && this.workerReady) {
       this.activeSource = 'worker';
+    } else if (this.worker && !this.workerFailed) {
+      // Worker existe mas ainda carregando — fallback até ready.
+      this.activeSource = 'fallback';
     } else {
-      // Worker existe mas não ready ainda — fallback até ready.
+      // Worker falhou ou não existe — fallback permanente.
       this.activeSource = 'fallback';
     }
 
@@ -191,6 +249,15 @@ export class FramingGuide {
       this._schedule();
       return;
     }
+    // Recalcula dimensões do canvas se o vídeo ganhou dimensões depois do
+    // start() (videoWidth=0 no start → h=NaN → getImageData falha). Também
+    // cobre o caso do throttle adaptativo ter mudado this.w.
+    const targetH = Math.max(1, Math.round((this.w * this.video.videoHeight) / this.video.videoWidth));
+    if (this.canvas.width !== this.w || this.canvas.height !== targetH) {
+      this.h = targetH;
+      this.canvas.width = this.w;
+      this.canvas.height = this.h;
+    }
     this.ctx.drawImage(this.video, 0, 0, this.w, this.h);
     const img = this.ctx.getImageData(0, 0, this.w, this.h);
     this.lastFrameTime = now;
@@ -231,9 +298,13 @@ export class FramingGuide {
   // -----------------------------------------------------------------------
 
   _createWorker() {
-    this.worker = new Worker(new URL('./frame-worker.js', import.meta.url));
+    // YOLO é o detector principal (99% acurácia, 96.7% especificidade).
+    // Fallback para frame-worker (OpenCV) se o YOLO falhar ao carregar.
+    this.worker = new Worker(new URL('./yolo-worker.js', import.meta.url));
     this.worker.onmessage = (e) => this._onWorkerMessage(e.data);
     this.worker.onerror = (e) => this._onWorkerError(e.message || String(e));
+    // Configuração ANTES do primeiro frame (conf=0.35 — gate browser validado).
+    this.worker.postMessage({ type: 'config', conf: this.conf });
   }
 
   _onWorkerMessage(msg) {
@@ -265,7 +336,8 @@ export class FramingGuide {
 
     // Instrumentação: tempo desde start() até ready (gate de carga de F6).
     const loadMs = performance.now() - this._startAt;
-    console.log('[FramingGuide] worker ready em', Math.round(loadMs), 'ms');
+    console.log('[FramingGuide] YOLO worker ready em', Math.round(loadMs), 'ms');
+    if (this.onStatus) this.onStatus({ detector: 'yolo', state: 'ready', loadMs: Math.round(loadMs) });
   }
 
   _onWorkerError(message) {
@@ -274,6 +346,7 @@ export class FramingGuide {
     this.workerReady = false;
     this.activeSource = 'fallback';
     this.inFlight = false;
+    if (this.onStatus) this.onStatus({ detector: 'fallback', state: 'error', message });
 
     // Termina o worker (erro real, não corrida de init).
     if (this.worker) {
@@ -303,8 +376,12 @@ export class FramingGuide {
     // fonte ativa. Um result do worker que chega depois de _onWorkerError
     // (rebaixamento para fallback) ainda alimentaria _adaptThrottle e
     // audio.update() — feedback de áudio vindo de fonte já rebaixada.
-    const expectedMode = this.activeSource === 'worker' ? 'otsu' : 'heuristic';
-    if (metrics && metrics.mode && metrics.mode !== expectedMode) {
+    // F2: a fonte worker emite qualquer modo de WORKER_MODES (otsu/adaptive/
+    // canny) — todos alimentam as mesmas stats, throttle e audio.update().
+    const modeOk = this.activeSource === 'worker'
+      ? WORKER_MODES.has(metrics && metrics.mode)
+      : (metrics && metrics.mode) === 'heuristic';
+    if (!modeOk) {
       return;
     }
 
@@ -323,8 +400,81 @@ export class FramingGuide {
     // Throttle adaptativo (F1 conservador): medir ms da fonte ativa.
     this._adaptThrottle(metrics.ms);
 
+    // Histerese temporal (estabilizador simples pré-F3): exigir N frames
+    // consecutivos com found=true antes de reportar found=true ao áudio.
+    // O YOLO pode oscilar entre found=true/false em frames adjacentes
+    // (falsos positivos transitórios). Sem isso, "Pronto" dispara no
+    // primeiro frame com detecção, mesmo que o próximo já não detecte.
+    if (metrics.found) {
+      this._foundStreak++;
+      if (this._foundStreak < FOUND_HOLD_FRAMES) {
+        // Ainda não tem confiança suficiente — reporta como sem folha.
+        metrics = { ...metrics, found: false };
+      }
+    } else {
+      this._foundStreak = 0;
+    }
+
+    // Debug visual: loga detecções a cada ~2s para não floodar o console.
+    const now = performance.now();
+    if (!this._lastDebugLog || now - this._lastDebugLog > 2000) {
+      this._lastDebugLog = now;
+      console.log('[FramingGuide] det:', metrics.found ? 'FOLHA' : 'sem folha',
+        '| mode:', metrics.mode, '| conf:', metrics.confidence?.toFixed(3),
+        '| ms:', metrics.ms?.toFixed(0), '| coverage:', metrics.coverage?.toFixed(3));
+      if (this.onStatus) {
+        this.onStatus({
+          detector: this.activeSource === 'worker' ? 'yolo' : 'fallback',
+          state: 'detecting',
+          found: metrics.found, conf: metrics.confidence, ms: metrics.ms,
+          coverage: metrics.coverage, mode: metrics.mode,
+        });
+      }
+    }
+
+    // UX fallback (F2b): tracking de "ready" + timeout de ajuda.
+    this._checkStuck(metrics);
+
     // Encaminha para áudio (em F1, sem estabilizador — direto).
     audio.update(metrics);
+  }
+
+  /**
+   * UX fallback (F2b): se o usuário não atinge "ready" (found + centralizado
+   * + cobertura na faixa) em STUCK_TIMEOUT_MS, fala "aproxime a folha".
+   * Repete a cada HELP_COOLDOWN_MS se continuar stuck. Reseta em ready.
+   *
+   * "Ready" usa as MESMAS constantes de audio.js (CENTER_MARGIN,
+   * TARGET_COVERAGE_MIN/MAX) — se elas mudarem lá, mudam aqui também
+   * (importadas, não duplicadas).
+   * @param {object} m - métricas do detector
+   */
+  _checkStuck(m) {
+    const now = performance.now();
+    const ready = m.found
+      && Math.abs(m.cx - 0.5) < CENTER_MARGIN
+      && Math.abs(m.cy - 0.5) < CENTER_MARGIN
+      && m.coverage >= TARGET_COVERAGE_MIN
+      && m.coverage <= TARGET_COVERAGE_MAX;
+
+    if (ready) {
+      this._lastReadyMs = now;
+      this._helpPending = false;
+      return;
+    }
+
+    const sinceReady = now - this._lastReadyMs;
+    if (sinceReady < STUCK_TIMEOUT_MS) return; // ainda dentro do tempo
+
+    // Passou do timeout — fala a ajuda (com cooldown de repetição).
+    const sinceHelp = now - this._lastHelpMs;
+    if (sinceHelp < HELP_COOLDOWN_MS) return;
+
+    this._lastHelpMs = now;
+    // Prioridade GUIDE (mesma das direções). Não preempcta STATUS, mas a
+    // frase é diferente das direções repetidas — passa pela fila sem
+    // ser suprimida pelo cooldown de frase idêntica do audio.js.
+    queue.speak('Não consigo enquadrar. Aproxime a folha da câmera.', PRIORITY.GUIDE);
   }
 
   /**

@@ -68,13 +68,35 @@ const sounds = {
 };
 
 // -------------------------------------------------------------------------
-// Guia sonoro de enquadramento (F1: delegado a FramingGuide)
-// O pipeline heurístico inline foi substituído por FramingGuide, que coordena
-// FallbackDetector (fonte ativa inicial) + worker OpenCV.js (Otsu-only).
+// Guia sonoro de enquadramento (F3: YOLOv8n como detector principal)
+// O pipeline OpenCV.js (F1/F2) foi substituído pelo YOLOv8n via
+// onnxruntime-web. Gate browser: 99% acurácia, 96.7% especificidade
+// (vs 69.9% / 0% do OpenCV). Modelo ONNX 12MB em vendor/.
 // Áudio/TTS em módulos: js/framing/audio.js (singleton) + js/speech.js (fila).
+// Fallback: se o YOLO não carregar, o FallbackDetector heurístico assume.
 // -------------------------------------------------------------------------
 
-const framingGuide = new FramingGuide();
+const framingGuide = new FramingGuide({
+  conf: 0.35,
+  onStatus: (info) => {
+    const el = document.getElementById('detectorStatus');
+    if (!el) return;
+    if (info.detector === 'yolo' && info.state === 'loading') {
+      el.textContent = 'Detector: baixando modelo YOLO (12MB)...';
+      el.style.borderColor = '#ffcc00';
+    } else if (info.detector === 'yolo' && info.state === 'ready') {
+      el.textContent = `Detector: YOLOv8n ativo (carregou em ${info.loadMs}ms)`;
+      el.style.borderColor = '#55ff88';
+    } else if (info.detector === 'fallback' && info.state === 'error') {
+      el.textContent = `Detector: fallback heurístico (YOLO falhou: ${info.message})`;
+      el.style.borderColor = '#ff5555';
+    } else if (info.state === 'detecting') {
+      const det = info.detector === 'yolo' ? 'YOLO' : 'fallback';
+      const found = info.found ? `FOLHA (conf=${(info.conf||0).toFixed(2)}, cov=${(info.coverage||0).toFixed(2)})` : 'sem folha';
+      el.textContent = `Detector: ${det} | ${found} | ${info.ms?.toFixed(0)}ms`;
+    }
+  },
+});
 let framingGuideEnabled = true; // pode ser desligado pelo botão "Guia sonoro"
 
 function startFramingGuide() {
