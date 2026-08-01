@@ -96,6 +96,13 @@ const framingGuide = new FramingGuide({
       el.textContent = `Detector: ${det} | ${found} | ${info.ms?.toFixed(0)}ms`;
     }
   },
+  onAutoCapture: () => {
+    // Auto-captura: o guia detectou enquadramento estável por 3s.
+    // Diz "Fotografando" e captura automaticamente, sem clique do usuário.
+    if (!mediaStream) return; // câmera já desligada
+    speechQueue.speak('Fotografando.', PRIORITY.STATUS);
+    setTimeout(() => capturePhoto(), 500); // pequeno delay para a voz terminar
+  },
 });
 let framingGuideEnabled = true; // pode ser desligado pelo botão "Guia sonoro"
 
@@ -433,6 +440,24 @@ els.repeatBtn.addEventListener('click', repeatResult);
 initApiKeyUI();
 initVoiceCommands();
 initGuideToggle();
+
+// Liga a câmera automaticamente ao abrir a página. O usuário cego não
+// precisa procurar o botão — a câmera já está ativa. Requer gesto do
+// usuário em alguns navegadores (política de permissões), mas a maioria
+// pede a permissão automaticamente via getUserMedia.
+// Pequeno delay para o AudioContext poder ser ativado pelo primeiro gesto
+// (toque em qualquer lugar da tela).
+document.body.addEventListener('click', function startOnFirstTouch() {
+  audio.activate();
+  if (!mediaStream) startCamera();
+  document.body.removeEventListener('click', startOnFirstTouch);
+}, { once: true });
+
+// Se já tem chave salva, tenta ligar a câmera imediatamente (alguns
+// navegadores permitem sem gesto se já houve permissão antes).
+if (localStorage.getItem('geminiApiKey')) {
+  startCamera().catch(() => {}); // silencia erro se bloquear sem gesto
+}
 
 // B4: destroy() termina o worker no fim de vida da página. pagehide (não
 // unload) — bfcache no iOS não dispara unload e o Safari o ignora.

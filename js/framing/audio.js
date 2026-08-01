@@ -40,9 +40,9 @@ const TTS_NOT_FOUND_COOLDOWN_MS = 8000;
 // usuário ouve as duas frases em rajada (o cooldown idêntico não impede
 // porque são frases DIFERENTES). 3s = tempo mínimo entre direções.
 const TTS_GLOBAL_COOLDOWN_MS = 3000;
-// Lock de "Pronto": uma vez dito, segura por 5s antes de permitir outra
-// direção. Evita "Pronto → Câmera para cima → Pronto" em oscilação.
-const READY_LOCK_MS = 5000;
+// Lock de "Mantenha assim": uma vez dito, segura por 10s antes de repetir.
+// O usuário estável não precisa ouvir isso a cada 5s — 10s é calmo.
+const READY_LOCK_MS = 10000;
 
 class AudioFeedback {
   constructor() {
@@ -129,19 +129,24 @@ class AudioFeedback {
     // Feedback falado — frases curtas padronizadas (≤5 palavras)
     // Lock de "Pronto": se disse "Pronto" há menos de READY_LOCK_MS, não
     // diz outra direção (evita oscilação Pronto→direção→Pronto).
+    // Detecções parciais (folha na borda) nunca dizem "Pronto" — sempre
+    // dão direção para centralizar.
     const nowMs = performance.now();
     const inReadyLock = nowMs < this._readyLockUntil;
-    if (centered && distanceOk) {
-      this._speakGuide('Pronto, pode capturar.');
+    const isPartial = !!m.partial;
+    if (!isPartial && centered && distanceOk) {
+      this._speakGuide('Mantenha assim.');
     } else if (!inReadyLock) {
-      if (!distanceOk && m.coverage < TARGET_COVERAGE_MIN) {
-        this._speakGuide('Aproxime.');
-      } else if (!distanceOk && m.coverage > TARGET_COVERAGE_MAX) {
-        this._speakGuide('Afaste.');
-      } else if (Math.abs(dx) >= CENTER_MARGIN) {
+      // Parcial ou não-centralizado: prioriza direção lateral sobre distância.
+      // Se a folha está na borda, mover a câmera é mais urgente que ajustar distância.
+      if (Math.abs(dx) >= CENTER_MARGIN) {
         this._speakGuide(dx < 0 ? 'Câmera para a esquerda.' : 'Câmera para a direita.');
       } else if (Math.abs(dy) >= CENTER_MARGIN) {
         this._speakGuide(dy < 0 ? 'Câmera para cima.' : 'Câmera para baixo.');
+      } else if (!distanceOk && m.coverage < TARGET_COVERAGE_MIN) {
+        this._speakGuide('Aproxime.');
+      } else if (!distanceOk && m.coverage > TARGET_COVERAGE_MAX) {
+        this._speakGuide('Afaste.');
       }
     }
   }
@@ -234,7 +239,7 @@ class AudioFeedback {
     const identicalCooldown = isNotFound ? TTS_NOT_FOUND_COOLDOWN_MS : TTS_COOLDOWN_MS;
     if (text === this._lastPhrase && now - this._lastSpokenAt < identicalCooldown) return;
 
-    const isReady = text === 'Pronto, pode capturar.';
+    const isReady = text === 'Mantenha assim.';
     // Cooldown global: qualquer frase não-ready dentro de 3s da última → suprime.
     // Ready passa direto (prioridade máxima do guia).
     if (!isReady && now - this._lastAnySpokenAt < TTS_GLOBAL_COOLDOWN_MS) return;
@@ -243,7 +248,8 @@ class AudioFeedback {
     this._lastPhrase = text;
     this._lastAnySpokenAt = now;
     if (isReady) {
-      // Lock: após "Pronto", segura direções por 5s mesmo se o detector oscilar.
+      // Lock: após "Mantenha assim", segura direções por 10s mesmo se o
+      // detector oscilar. Auto-captura dispara após 3s estável.
       this._readyLockUntil = now + READY_LOCK_MS;
     }
     queue.speak(text, PRIORITY.GUIDE);

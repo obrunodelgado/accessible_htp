@@ -82,27 +82,65 @@ function preprocess(rgba, w, h) {
  * Pós-processamento: output YOLOv8 [1, 5, 2100] → detecções.
  * Formato: [cx, cy, w, h, conf] por anchor, normalizado em [0, IMGSZ].
  * Retorna a detecção de maior confiança acima do threshold, ou null.
+ *
+ * Detecção parcial: se nenhuma detecção passa o threshold principal,
+ * busca a melhor detecção com conf >= PARTIAL_CONF_THRESHOLD que toca
+ * a borda do frame. Folhas parcialmente fora do quadro têm confiança
+ * baixa (modelo treinado em folhas completas) mas ainda são úteis para
+ * dar direção ao usuário ("câmera para a esquerda" etc).
  */
+var PARTIAL_CONF_THRESHOLD = 0.15;
+
 function postprocess(outputData) {
   // output shape: [1, 5, 2100] — 5 = 4 bbox + 1 class conf
   var numAnchors = 2100;
   var bestConf = 0;
   var bestIdx = -1;
+  // Também rastreia a melhor detecção parcial (conf baixa + borda).
+  var bestPartialConf = 0;
+  var bestPartialIdx = -1;
+
   for (var i = 0; i < numAnchors; i++) {
     var conf = outputData[4 * numAnchors + i];
     if (conf > bestConf && conf >= CONF_THRESHOLD) {
       bestConf = conf;
       bestIdx = i;
     }
+    // Detecção parcial: conf entre PARTIAL_CONF_THRESHOLD e CONF_THRESHOLD,
+    // e o bbox toca a borda do frame.
+    if (conf >= PARTIAL_CONF_THRESHOLD && conf < CONF_THRESHOLD && conf > bestPartialConf) {
+      var pcx = outputData[i] / IMGSZ;
+      var pcy = outputData[numAnchors + i] / IMGSZ;
+      var pw = outputData[2 * numAnchors + i] / IMGSZ;
+      var ph = outputData[3 * numAnchors + i] / IMGSZ;
+      var touchesEdge = (pcx - pw / 2 <= 0.02) || (pcy - ph / 2 <= 0.02) ||
+                        (pcx + pw / 2 >= 0.98) || (pcy + ph / 2 >= 0.98);
+      if (touchesEdge) {
+        bestPartialConf = conf;
+        bestPartialIdx = i;
+      }
+    }
   }
-  if (bestIdx < 0) return null;
 
-  // Coordenadas em pixels do espaço 320x320 — normalizar para [0,1].
-  var cx = outputData[bestIdx] / IMGSZ;
-  var cy = outputData[numAnchors + bestIdx] / IMGSZ;
-  var bw = outputData[2 * numAnchors + bestIdx] / IMGSZ;
-  var bh = outputData[3 * numAnchors + bestIdx] / IMGSZ;
-  return { cx: cx, cy: cy, w: bw, h: bh, conf: bestConf };
+  if (bestIdx >= 0) {
+    // Detecção normal (conf >= threshold principal)
+    var cx = outputData[bestIdx] / IMGSZ;
+    var cy = outputData[numAnchors + bestIdx] / IMGSZ;
+    var bw = outputData[2 * numAnchors + bestIdx] / IMGSZ;
+    var bh = outputData[3 * numAnchors + bestIdx] / IMGSZ;
+    return { cx: cx, cy: cy, w: bw, h: bh, conf: bestConf, partial: false };
+  }
+
+  if (bestPartialIdx >= 0) {
+    // Detecção parcial (conf baixa + borda) — folha saindo do quadro
+    var pcx2 = outputData[bestPartialIdx] / IMGSZ;
+    var pcy2 = outputData[numAnchors + bestPartialIdx] / IMGSZ;
+    var pw2 = outputData[2 * numAnchors + bestPartialIdx] / IMGSZ;
+    var ph2 = outputData[3 * numAnchors + bestPartialIdx] / IMGSZ;
+    return { cx: pcx2, cy: pcy2, w: pw2, h: ph2, conf: bestPartialConf, partial: true };
+  }
+
+  return null;
 }
 
 /**
@@ -131,6 +169,7 @@ function processFrame(msg) {
         type: 'result',
         found: false, cx: 0.5, cy: 0.5, coverage: 0, bboxAspect: 0,
         tilt: 0, touchesEdge: false, confidence: 0, score: 0,
+        partial: false,
         mode: 'yolo', ms: ms, wasmHeap: 0, width: w, height: h,
       });
       return;
@@ -147,6 +186,7 @@ function processFrame(msg) {
       found: true, cx: det.cx, cy: det.cy, coverage: coverage,
       bboxAspect: bboxAspect, tilt: 0, touchesEdge: touchesEdge,
       confidence: det.conf, score: det.conf,
+      partial: det.partial,
       mode: 'yolo', ms: ms, wasmHeap: 0, width: w, height: h,
     });
   }).catch(function(err) {

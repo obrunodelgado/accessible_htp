@@ -48,6 +48,12 @@ const HELP_COOLDOWN_MS = 12000;   // repete a cada 12s se continuar stuck
 // rajada. Reset no primeiro found=false.
 const FOUND_HOLD_FRAMES = 3;
 
+// Auto-captura: após AUTO_CAPTURE_DELAY_MS estável em "ready" (folha
+// encontrada + centralizada + cobertura na faixa), dispara onAutoCapture.
+// O usuário cego não precisa clicar — a captura acontece sozinha quando
+// o enquadramento está bom por tempo suficiente.
+const AUTO_CAPTURE_DELAY_MS = 3000;
+
 // Throttle adaptativo (F1 conservador; refinamento é F6).
 // YOLO: inference ~63ms desktop, ~150-300ms estimado Moto E. O throttle
 // padrão de 450ms acomoda o YOLO com folga no desktop; no Moto E pode
@@ -62,14 +68,16 @@ const WIDTH_MIN = 120;
 
 export class FramingGuide {
   /**
-   * @param {{conf?: number, onStatus?: function}} [opts] YOLO: limiar de
-   *   confiança da detecção (default 0.35 — gate browser validado: 99%
-   *   acurácia, 96.7% espec). onStatus: callback para reportar status do
-   *   detector (para debug visual no front).
+   * @param {{conf?: number, onStatus?: function, onAutoCapture?: function}} [opts]
+   *   YOLO: limiar de confiança da detecção (default 0.35 — gate browser
+   *   validado: 99% acurácia, 96.7% espec). onStatus: callback para reportar
+   *   status do detector (debug visual). onAutoCapture: callback disparado
+   *   após AUTO_CAPTURE_DELAY_MS estável em "ready" — captura automática.
    */
   constructor(opts = {}) {
     this.conf = opts.conf || 0.35;
     this.onStatus = opts.onStatus || null;
+    this.onAutoCapture = opts.onAutoCapture || null;
     this.video = null;
     this.canvas = null;
     this.ctx = null;
@@ -112,6 +120,12 @@ export class FramingGuide {
     // Histerese temporal: contador de frames consecutivos com found=true.
     this._foundStreak = 0;
 
+    // Auto-captura: timestamp do início do estado "ready" estável.
+    // null = não está em ready. Quando atinge AUTO_CAPTURE_DELAY_MS,
+    // dispara onAutoCapture e seta _autoCaptureFired para não repetir.
+    this._readySinceMs = null;
+    this._autoCaptureFired = false;
+
     // Pré-carregamento: cria o worker imediatamente no construtor para
     // baixar o modelo ONNX (12MB) em background, sem esperar o usuário
     // clicar na câmera. O worker emite 'ready' quando o modelo carrega;
@@ -151,6 +165,10 @@ export class FramingGuide {
     this._lastReadyMs = this._startAt;
     this._lastHelpMs = 0;
     this._helpPending = false;
+
+    // Auto-captura: reseta a cada start().
+    this._readySinceMs = null;
+    this._autoCaptureFired = false;
 
     // Worker: já foi criado no construtor (pré-carregamento). Se falhou
     // antes, fica no fallback. Se já está ready, troca fonte imediatamente.
@@ -405,11 +423,20 @@ export class FramingGuide {
     // O YOLO pode oscilar entre found=true/false em frames adjacentes
     // (falsos positivos transitórios). Sem isso, "Pronto" dispara no
     // primeiro frame com detecção, mesmo que o próximo já não detecte.
+    //
+    // Exceção: detecções parciais (folha na borda do quadro) bypassam a
+    // histerese — a folha está saindo do quadro e o usuário precisa de
+    // direção imediata, não de 3 frames de confirmação.
     if (metrics.found) {
-      this._foundStreak++;
-      if (this._foundStreak < FOUND_HOLD_FRAMES) {
-        // Ainda não tem confiança suficiente — reporta como sem folha.
-        metrics = { ...metrics, found: false };
+      if (metrics.partial) {
+        // Parcial: reseta streak mas reporta found=true imediatamente.
+        this._foundStreak = 0;
+      } else {
+        this._foundStreak++;
+        if (this._foundStreak < FOUND_HOLD_FRAMES) {
+          // Ainda não tem confiança suficiente — reporta como sem folha.
+          metrics = { ...metrics, found: false };
+        }
       }
     } else {
       this._foundStreak = 0;
@@ -452,6 +479,7 @@ export class FramingGuide {
   _checkStuck(m) {
     const now = performance.now();
     const ready = m.found
+      && !m.partial
       && Math.abs(m.cx - 0.5) < CENTER_MARGIN
       && Math.abs(m.cy - 0.5) < CENTER_MARGIN
       && m.coverage >= TARGET_COVERAGE_MIN
@@ -460,8 +488,23 @@ export class FramingGuide {
     if (ready) {
       this._lastReadyMs = now;
       this._helpPending = false;
+
+      // Auto-captura: se estável em ready por AUTO_CAPTURE_DELAY_MS,
+      // dispara onAutoCapture (uma vez por sessão de start()).
+      if (!this._autoCaptureFired && this.onAutoCapture) {
+        if (this._readySinceMs === null) {
+          this._readySinceMs = now;
+        } else if (now - this._readySinceMs >= AUTO_CAPTURE_DELAY_MS) {
+          this._autoCaptureFired = true;
+          this.onAutoCapture();
+        }
+      }
       return;
     }
+
+    // Saiu de ready — reset do timer de auto-captura (mas não do fired,
+    // que só reset a cada start()).
+    this._readySinceMs = null;
 
     const sinceReady = now - this._lastReadyMs;
     if (sinceReady < STUCK_TIMEOUT_MS) return; // ainda dentro do tempo
