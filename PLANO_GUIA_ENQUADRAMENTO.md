@@ -1,5 +1,47 @@
 # Plano de Desenvolvimento — Guia de Enquadramento da Folha (OpenCV.js + WebRTC)
 
+> **STATUS DE EXECUÇÃO (atualizado em 2026-08-01):**
+>
+> Este plano foi a especificação original para as fases F0–F7. A execução real
+> desviou em pontos importantes — o registro da verdade está em `BENCHMARK.md`.
+>
+> **F0 (baseline heurística)**: executado. Detector heurístico extraído para
+> `js/framing/fallback-detector.js`. Medições de latência em `BENCHMARK.md`.
+>
+> **F1 (OpenCV.js + Worker)**: executado. Worker clássico com Otsu, canvas
+> 160×120 com aspecto preservado, fallback heurístico, SW com cache-first
+> para vendor/. A2/A3/A4/A5 não medidos em aparelho (pendente).
+>
+> **F2 (cascata + score geométrico)**: executado, mas **reprovado em
+> especificidade**. Cascata Otsu→adaptive→Canny + CLAHE + score geométrico
+> (área/aspecto/convexidade/centro). Gate em dataset balanceado 73:30:
+> 69.9% acurácia, 98.6% sensibilidade, **0% especificidade** (30/30 FPs).
+> Diagnóstico de textura/contraste descartado por medição — nenhum sinal
+> separa folhas reais de falsos retângulos do fundo. A1 (≥85%) reprovado.
+>
+> **F3 (YOLOv8n — desvio do plano original)**: o pipeline OpenCV.js foi
+> **substituído** por um modelo YOLOv8n (1 classe `paper_sheet`) via
+> onnxruntime-web (WASM). Gate browser: **99% acurácia, 100% sensibilidade,
+> 96.7% especificidade**, 63ms inference (Safari desktop). Modelo ONNX 12MB
+> em `vendor/paper-yolov8n.onnx`, worker em `js/framing/yolo-worker.js`.
+> OpenCV.js mantido como fallback (não como detector principal).
+>
+> **Mudanças de arquitetura vs plano**:
+> - **Detector principal**: YOLOv8n (ONNX/WASM) em vez de OpenCV.js
+> - **Feedback de áudio**: oscilador **removido** (buzz irritante para
+>   usuário cego) — feedback só por voz, conforme feedback do usuário
+> - **Histerese temporal**: 3 frames consecutivos antes de reportar found
+>   (estabilizador simples, em vez de EMA + máquina de estados)
+> - **Hápticos (F5)**: não implementado — `navigator.vibrate` tem suporte
+>   irregular e o feedback por voz mostrou-se suficiente
+> - **Pré-carregamento**: worker criado no construtor (modelo baixa ao
+>   abrir a página, não ao clicar na câmera)
+>
+> **F4–F7**: não executados. F6 (otimização) parcialmente pendente.
+> F8 (testes com usuários cegos) fora de escopo.
+
+---
+
 Documento de especificação para implementação por outro modelo/dev. Substitui o guia
 heurístico atual (`analyzeFrameForGuide` / `detectSheetBounds` em `app.js`) por um
 pipeline OpenCV.js robusto a fundo de baixo contraste, com feedback **auditivo** e

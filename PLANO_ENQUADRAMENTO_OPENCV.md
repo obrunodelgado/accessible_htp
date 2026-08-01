@@ -3,8 +3,69 @@ agent: devin-local
 session: basalt-speech
 created: 2026-07-31T16:55:35Z
 revised: 2026-07-31 (rev. 3 — verificada contra o código real de app.js / sw.js / index.html)
+revised: 2026-08-01 (rev. 4 — status de execução F0–F3, desvio para YOLOv8n)
 ---
 # Guia de Enquadramento — OpenCV.js + WebRTC
+
+> **STATUS DE EXECUÇÃO (rev. 4, atualizado em 2026-08-01):**
+>
+> Este plano foi a especificação detalhada para F0–F7 com OpenCV.js. A
+> execução real desviou em F3 — o registro da verdade está em `BENCHMARK.md`.
+>
+> **F0 (baseline heurística)**: ✅ executado. Detector extraído para
+> `js/framing/fallback-detector.js`. Medições em `BENCHMARK.md`.
+>
+> **F1 (OpenCV.js + Worker)**: ✅ executado. Worker clássico com Otsu,
+> canvas 160×120 com aspecto, fallback heurístico, SW cache-first vendor/.
+>
+> **F2 (cascata + score geométrico)**: ⚠️ executado mas **reprovado**.
+> Cascata Otsu→adaptive→Canny + CLAHE + score (área/aspecto/convexidade/
+> centro, threshold 0.45). Gate em dataset balanceado 73:30:
+> **69.9% acurácia, 98.6% sensibilidade, 0% especificidade**. A1 reprovado.
+> Diagnóstico de textura (`boundaryContrast`, `interiorMean`, `edgeDensity`,
+> sinais de cor) medido e descartado — nenhum sinal separa folhas de falsos
+> retângulos. Limitação estrutural: score geométrico mede forma, não conteúdo.
+>
+> **F3 (YOLOv8n — desvio do plano)**: o pipeline OpenCV.js foi **substituído**
+> como detector principal por um modelo YOLOv8n (1 classe `paper_sheet`)
+> via onnxruntime-web (WASM, sem WebGPU). Resultados do gate browser:
+> - **99% acurácia, 100% sensibilidade, 96.7% especificidade** (conf=0.35)
+> - **63ms inference mediana** (Safari desktop WASM)
+> - Modelo ONNX 12MB em `vendor/paper-yolov8n.onnx`
+> - Worker: `js/framing/yolo-worker.js` (clássico, importScripts ort.min.js)
+> - onnxruntime-web 1.18.0: `vendor/ort.min.js` (528KB) + 2 arquivos WASM (~20MB)
+> - Treino: 103 stills (73 pos + 30 neg), split 80/20, augmentation padrão
+> - Threshold conf=0.35 escolhido por simulação (Tabela 2 em BENCHMARK.md):
+>   0.65 elimina o único FP mas perde 3 folhas reais — trade-off desfavorável
+>
+> **Mudanças de arquitetura vs plano original**:
+> - **Detector principal**: YOLOv8n (ONNX/WASM) em vez de OpenCV.js. O
+>   OpenCV.js (`frame-worker.js`) é mantido como fallback se o YOLO falhar
+> - **Feedback de áudio**: oscilador **removido** — buzz era irritante para
+>   o usuário cego (feedback direto do usuário). Feedback só por voz
+> - **Histerese temporal**: 3 frames consecutivos com found=true antes de
+>   reportar found (estabilizador simples, em vez de EMA + máquina de
+>   estados de 6 estados do plano)
+> - **Hápticos (F5)**: não implementado. `navigator.vibrate` tem suporte
+>   irregular (removido no Firefox, nunca existiu no Safari) e o feedback
+>   por voz mostrou-se suficiente em teste
+> - **Pré-carregamento**: worker criado no construtor do `FramingGuide`
+>   (modelo baixa ao abrir a página, não ao clicar na câmera)
+> - **Cooldowns de TTS revisados**: "Folha não encontrada" 8s, direções 3s,
+>   "Pronto" com lock de 5s (evita oscilação Pronto→direção→Pronto)
+> - **SW v5**: vendor cache v2 (ort + wasm + onnx ~42MB), cache-first
+>
+> **F4–F7**: não executados. F6 (otimização) parcialmente pendente.
+> F8 (testes com usuários cegos) fora de escopo.
+>
+> **Pendências que persistem do plano original**:
+> - A2 (latência ≤150ms): YOLO é 63ms desktop, ~150-300ms estimado Moto E
+> - A3 (5-8 fps Moto E): não medido em aparelho
+> - A4 (memória <40MB): não medido
+> - A5 (falsos "Pronto" <2%): histerese de 3 frames mitiga, não medido
+> - A6 (tempo até enquadrar ≤20s): exige usuários cegos
+> - A8 (latência ponta-a-pont): não medido em aparelho
+> - Generalização do YOLO: 103 stills é pouco, precisa dataset expandido
 
 Substituir o detector heurístico de folha em `app.js` por um pipeline OpenCV.js em Web Worker, com feedback auditivo refinado, vibração, estabilização anti-oscilação e degradação graciosa — cobrindo as fases F0–F7 do `PLANO_GUIA_ENQUADRAMENTO.md`.
 
